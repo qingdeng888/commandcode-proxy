@@ -1045,6 +1045,32 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 // 上游错误是否值得换个 Key 重试（Key 失效 / 余额不足 / 限流 / 上游 5xx）
 const RETRYABLE_KEY_STATUS = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
 
+// 状态码之外还要看错误体：上游把「模型不在套餐内」这类与 Key 无关的业务限制
+// 也用 401/403 表达，若一律当作 Key 失效，多 Key 下会把每个 Key 都试一遍才放弃
+const NON_KEY_ERROR_MARKERS = ['MODEL_NOT_IN_PLAN'];
+
+function isKeyIndependentError(bodyText) {
+  return NON_KEY_ERROR_MARKERS.some(marker => bodyText.includes(marker));
+}
+
+// 读取错误响应体并还原为等价的新 Response。body 只能消费一次，
+// 因此判定「不值得换 Key」后必须把响应还原回去交给调用方；
+// 且 undici 已自动解压，只保留 content-type，避免残留的 content-encoding 触发二次解压
+async function drainErrorResponse(response) {
+  const text = await response.text().catch(() => '');
+  const headers = new Headers();
+  const contentType = response.headers.get('content-type');
+  if (contentType) headers.set('content-type', contentType);
+  return {
+    text,
+    response: new Response(text, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    }),
+  };
+}
+
 // 带换 Key 重试的上游调用：始终返回最后一次的响应，错误映射仍由调用方按原逻辑处理
 // 单 Key（或透传模式）下 maxAttempts ≤ 1，等价于不重试，行为与改动前一致
 async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
@@ -1057,13 +1083,22 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
     await ensureInitialized(key, signal);
     const response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
 
-    // 成功 / 错误与 Key 无关 / 已试满上限 → 交给调用方处理
+    // 成功 / 已试满上限 / 状态码本身不值得重试 → 交给调用方处理
     if (response.ok || attempt >= maxAttempts || !RETRYABLE_KEY_STATUS.has(response.status)) {
       return { response };
     }
 
+    // 状态码看似可重试，还要排除「换 Key 也无济于事」的业务错误
+    const { text, response: restored } = await drainErrorResponse(response);
+    if (isKeyIndependentError(text)) {
+      log('warn', 'Upstream error is key-independent, not switching key', {
+        status: response.status, attempt, triedCount: tried.size,
+      });
+      return { response: restored };
+    }
+
     const nextKey = pickUpstreamKey(tried);
-    if (!nextKey || tried.has(nextKey)) return { response };   // 已无其他可用 Key
+    if (!nextKey || tried.has(nextKey)) return { response: restored };   // 已无其他可用 Key
 
     log('warn', 'Upstream key failed, switching key', {
       status: response.status, attempt, triedCount: tried.size,
