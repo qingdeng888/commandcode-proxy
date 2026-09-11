@@ -38,7 +38,8 @@ commandcode/
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # 单文件核心代理（~1900 行）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
-├── docker-compose.yml    # 容器编排
+├── docker-compose.yml    # 容器编排（默认使用 GHCR 预构建镜像）
+├── docker-compose.local.yml   # 本地源码构建编排
 ├── .dockerignore         # 构建上下文排除规则
 ├── .github/
 │   └── workflows/
@@ -499,7 +500,7 @@ CLI 发送图片的格式：
 
 ### 从 GHCR 拉取
 
-每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
+推送到 `master` / `main` / `release` 分支或打 `v*` tag 时，GitHub Actions 会构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
 
 ```bash
 cp config.json.example config.json
@@ -509,9 +510,20 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
   ghcr.io/qingdeng888/commandcode-proxy:latest
 ```
 
-每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
+推送到 `master` / `main` 会更新 `latest` 标签，`v*` tag 额外生成版本标签。
+
+> ℹ️ **GHCR 包默认为私有**，拉取前需登录：
+>
+> ```bash
+> docker login ghcr.io -u <你的 GitHub 用户名>
+> ```
+>
+> 密码填入具有 `read:packages` 权限的 PAT（本机已登录 `gh` 时可直接用 `gh auth token`）。
+> 希望匿名拉取，可在包的 **Settings → Danger Zone → Change visibility** 中改为 Public。
 
 ### 快速启动 (docker compose)
+
+默认编排 `docker-compose.yml` 直接拉取上一步的预构建镜像，无需本地构建：
 
 ```bash
 docker compose up -d
@@ -544,7 +556,17 @@ cp config.json.example config.json
 >
 > ⚠️ **容器内端口恒为 `3050`**：`Dockerfile` 与 `docker-compose.yml` 都设置了 `PORT=3050` 环境变量，而环境变量的优先级**高于** `config.json` 的 `port` 字段。因此挂载配置文件里的 `port` 字段不会改变容器内监听端口 —— 对外端口由 `PROXY_PORT`（主机侧映射）决定。
 
-### 从源码构建
+### 从源码构建（本地开发）
+
+需要基于当前源码构建时，改用 `docker-compose.local.yml` —— 它与默认编排的唯一区别是把 `image:` 换成 `build: .`，端口映射、配置挂载、健康检查保持一致：
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+产物镜像标记为 `commandcode-proxy:local`，与从 GHCR 拉取的 `latest` 相互隔离、互不覆盖，两套编排可以并存。
+
+也可以只用 CLI 构建：
 
 ```bash
 docker build -t commandcode-proxy:latest .

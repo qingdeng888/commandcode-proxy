@@ -1,8 +1,13 @@
+# 本地开发编排：基于当前源码构建镜像，不使用 GHCR 预构建版本。
+#   docker compose -f docker-compose.local.yml up -d --build
+#
+# 与 docker-compose.yml 的唯一区别是把预构建的 image 换成 build: .，
+# 其余端口映射、配置挂载、健康检查保持一致，便于两套编排互相对照。
 services:
   proxy:
-    # 默认使用 GitHub Actions 预构建的多架构镜像（linux/amd64 + linux/arm64）。
-    # 需要基于当前源码本地构建时，改用：docker compose -f docker-compose.local.yml up -d --build
-    image: ghcr.io/qingdeng888/commandcode-proxy:latest
+    build: .
+    # 本地构建产物单独命名，避免与从 GHCR 拉取的 latest 相互覆盖
+    image: commandcode-proxy:local
     ports:
       # 宿主端口 → 容器内固定 3050，可用 PROXY_PORT 自定义宿主侧
       - "${PROXY_PORT:-3050}:3050"

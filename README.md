@@ -30,12 +30,13 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ```
 commandcode/
-├── config.json           # Port / log path etc.
+├── config.json.example   # Config template (copy to config.json)
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # Single-file proxy core (~1900 lines)
 ├── Dockerfile            # Container build (node:22-alpine)
-├── docker-compose.yml    # Container orchestration
+├── docker-compose.yml    # Container orchestration (prebuilt GHCR image)
+├── docker-compose.local.yml   # Local source-build orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
 │   └── workflows/
@@ -428,7 +429,7 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 
 ### Pull from GHCR
 
-Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions:
+Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry by GitHub Actions on every push to `master` / `main` / `release` and on every `v*` tag:
 
 ```bash
 cp config.json.example config.json
@@ -438,9 +439,20 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
   ghcr.io/qingdeng888/commandcode-proxy:latest
 ```
 
-The `latest` tag is updated on each release. The image is public — no login required to pull.
+Pushes to `master` / `main` update the `latest` tag; `v*` tags produce additional version tags.
+
+> ℹ️ **GHCR packages are private by default**, so log in before pulling:
+>
+> ```bash
+> docker login ghcr.io -u <your-github-username>
+> ```
+>
+> Use a PAT with the `read:packages` scope as the password (or `gh auth token` if `gh` is already logged in).
+> To allow anonymous pulls, switch the package to Public under **Settings → Danger Zone → Change visibility**.
 
 ### Quick Start (docker compose)
+
+The default `docker-compose.yml` pulls the prebuilt image above — no local build required:
 
 ```bash
 docker compose up -d
@@ -452,7 +464,17 @@ The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize th
 PROXY_PORT=13050 docker compose up -d
 ```
 
-### Build from Source
+### Build from Source (local development)
+
+To build from the current source instead, use `docker-compose.local.yml` — its only difference from the default compose file is `image:` replaced by `build: .`; ports, config mount and healthcheck stay identical:
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+The resulting image is tagged `commandcode-proxy:local`, kept separate from the `latest` pulled from GHCR so both can coexist.
+
+Or with the plain CLI:
 
 ```bash
 docker build -t commandcode-proxy:latest .
