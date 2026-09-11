@@ -16,6 +16,8 @@ function loadConfig() {
   const defaults = {
     port: 3000,
     host: '0.0.0.0',
+    proxyKey: '',   // 本地访问口令：非空时启用严格鉴权（客户端只认它，上游固定用 apiKey）
+    apiKey: '',     // 上游 CC API Key：单个字符串或字符串数组（多 Key 随机轮询）
     apiBase: 'https://api.commandcode.ai',
     projectSlug: 'cc-proxy',
     logFile: '',
@@ -39,12 +41,19 @@ function loadConfig() {
   // 环境变量覆写
   if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
   if (process.env.HOST) defaults.host = process.env.HOST;
+  if (process.env.PROXY_KEY) defaults.proxyKey = process.env.PROXY_KEY;
+  if (process.env.CC_API_KEY) defaults.apiKey = process.env.CC_API_KEY.split(',');   // 逗号分隔多 Key
   if (process.env.CC_API_BASE) defaults.apiBase = process.env.CC_API_BASE;
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
+
+  // 归一化为 apiKeyList：兼容单个字符串或字符串数组，剔除空白项
+  defaults.apiKeyList = (Array.isArray(defaults.apiKey) ? defaults.apiKey : [defaults.apiKey])
+    .filter(k => typeof k === 'string' && k.trim())
+    .map(k => k.trim());
 
   return defaults;
 }
@@ -920,6 +929,86 @@ function getApiKey(headers) {
   return null;
 }
 
+// ── 客户端鉴权 ──────────────────────────────────────
+// 提取客户端提交的凭证（OpenAI SDK: Authorization: Bearer；Anthropic SDK: x-api-key）
+function extractCredential(headers) {
+  const auth = headers['authorization'] || headers['Authorization'] || '';
+  if (auth.startsWith('Bearer ')) {
+    const v = auth.slice(7).trim();
+    if (v) return v;
+  }
+  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+  return xKey.trim() || null;
+}
+
+// 定长比较：避免逐字节比对泄露时序信息
+function safeEqual(a, b) {
+  const ba = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+const AUTH_ERR_MSG = {
+  missing: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header',
+  invalid: 'Invalid API key',
+  upstream_unconfigured: 'Server upstream API key not configured',
+};
+
+// ── 上游 Key 选择（多 Key 随机轮询）──────────────────
+// 随机选取并避让连续重复；连续命中同一 Key 达上限后不再避让，兜底打破死锁
+const MAX_CONSECUTIVE_SAME_KEY = 8;
+const MAX_KEY_ATTEMPTS = 3;   // 单请求最多尝试的 Key 个数
+
+let lastPickedKey = null;
+let consecutiveSameKey = 0;
+
+// exclude：本轮已失败的 Key，优先避开
+function pickUpstreamKey(exclude) {
+  const keys = CFG.apiKeyList;
+  if (!keys || keys.length === 0) return null;
+  if (keys.length === 1) return keys[0];
+
+  let pool = exclude && exclude.size ? keys.filter(k => !exclude.has(k)) : keys;
+  if (pool.length === 0) pool = keys;   // 全部试过，回到全集
+
+  // 避让上次使用的 Key；已达连续上限则跳过避让
+  if (pool.length > 1 && consecutiveSameKey < MAX_CONSECUTIVE_SAME_KEY) {
+    const avoided = pool.filter(k => k !== lastPickedKey);
+    if (avoided.length > 0) pool = avoided;
+  }
+
+  const key = pool[Math.floor(Math.random() * pool.length)];
+  consecutiveSameKey = key === lastPickedKey ? consecutiveSameKey + 1 : 1;
+  lastPickedKey = key;
+  return key;
+}
+
+// 鉴权入口：成功返回 { upstreamKey }，失败返回 { error }
+// - proxyKey 非空 → 严格模式：客户端只认 proxyKey，上游凭证从 apiKey 列表随机选取（不再透传）
+// - proxyKey 为空 → 保护未启用，沿用旧的透传行为
+function authenticate(headers) {
+  if (!CFG.proxyKey) {
+    const key = getApiKey(headers);
+    return key ? { upstreamKey: key } : { error: 'missing' };
+  }
+  const cred = extractCredential(headers);
+  if (!cred) return { error: 'missing' };
+  if (!safeEqual(cred, CFG.proxyKey)) return { error: 'invalid' };
+  if (CFG.apiKeyList.length === 0) return { error: 'upstream_unconfigured' };
+  return { upstreamKey: pickUpstreamKey() };
+}
+
+// 统一的鉴权失败响应；Anthropic 端点的错误结构不同
+function sendAuthError(res, code, anthropicStyle = false) {
+  const status = code === 'upstream_unconfigured' ? 500 : 401;
+  const message = AUTH_ERR_MSG[code];
+  if (anthropicStyle) {
+    sendJSON(res, status, { type: 'error', error: { type: 'authentication_error', message } });
+  } else {
+    sendJSON(res, status, { error: { message, type: 'authentication_error' } });
+  }
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -953,6 +1042,36 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   return response;
 }
 
+// 上游错误是否值得换个 Key 重试（Key 失效 / 余额不足 / 限流 / 上游 5xx）
+const RETRYABLE_KEY_STATUS = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
+
+// 带换 Key 重试的上游调用：始终返回最后一次的响应，错误映射仍由调用方按原逻辑处理
+// 单 Key（或透传模式）下 maxAttempts ≤ 1，等价于不重试，行为与改动前一致
+async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
+  const maxAttempts = Math.min(CFG.apiKeyList.length, MAX_KEY_ATTEMPTS);
+  const tried = new Set();
+  let key = firstKey;
+
+  for (let attempt = 1; ; attempt++) {
+    tried.add(key);
+    await ensureInitialized(key, signal);
+    const response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
+
+    // 成功 / 错误与 Key 无关 / 已试满上限 → 交给调用方处理
+    if (response.ok || attempt >= maxAttempts || !RETRYABLE_KEY_STATUS.has(response.status)) {
+      return { response };
+    }
+
+    const nextKey = pickUpstreamKey(tried);
+    if (!nextKey || tried.has(nextKey)) return { response };   // 已无其他可用 Key
+
+    log('warn', 'Upstream key failed, switching key', {
+      status: response.status, attempt, triedCount: tried.size,
+    });
+    key = nextKey;
+  }
+}
+
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
@@ -968,11 +1087,12 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
+  const auth = authenticate(req.headers);
+  if (auth.error) {
+    sendAuthError(res, auth.error);
     return;
   }
+  const apiKey = auth.upstreamKey;
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -992,10 +1112,10 @@ async function handleChatCompletions(req, res) {
   let translator = null;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    // 转发到 CC API（传入客户端 headers 用于提取 session ID；遇 Key 失效/限流自动换 Key 重试）
+    const { response: ccResponse } = await forwardWithKeyRetry(
+      ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key
+    );
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1756,11 +1876,12 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
+  const auth = authenticate(req.headers);
+  if (auth.error) {
+    sendAuthError(res, auth.error, true);
     return;
   }
+  const apiKey = auth.upstreamKey;
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
@@ -1778,9 +1899,10 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    // 转发到 CC API（遇 Key 失效/限流自动换 Key 重试）
+    const { response: ccResponse } = await forwardWithKeyRetry(
+      ccBody, apiKey, req.headers, abortController.signal
+    );
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -2111,8 +2233,13 @@ async function fetchModels(apiKey) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
+  const auth = authenticate(req.headers);
+  // 保护未启用时，模型列表仍对无凭证请求开放（保持原有行为）
+  if (auth.error && CFG.proxyKey) {
+    sendAuthError(res, auth.error);
+    return;
+  }
+  const models = await fetchModels(auth.upstreamKey ?? null);
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -2225,7 +2352,17 @@ server.listen(CFG.port, CFG.host, () => {
       hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
-  if (!CFG.apiKey) {
+  if (CFG.proxyKey) {
+    if (CFG.apiKeyList.length > 0) {
+      log('info', 'Access protection enabled. Clients authenticate with proxyKey; upstream keys are picked randomly.', {
+        upstreamKeys: CFG.apiKeyList.length,
+        maxConsecutiveSameKey: MAX_CONSECUTIVE_SAME_KEY,
+        maxAttemptsPerRequest: Math.min(CFG.apiKeyList.length, MAX_KEY_ATTEMPTS),
+      });
+    } else {
+      log('warn', 'proxyKey is set but apiKey is empty. All API requests will fail with 500 until at least one upstream user_ key is configured.');
+    }
+  } else if (CFG.apiKeyList.length === 0) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });

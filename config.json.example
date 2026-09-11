@@ -1,7 +1,8 @@
 {
   "port": 3050,
   "host": "0.0.0.0",
-  "apiKey": "",
+  "proxyKey": "your-proxy-key",
+  "apiKey": ["user_xxxxxxxxx", "user_yyyyyyyyy"],
   "apiBase": "https://api.commandcode.ai",
   "projectSlug": "cc-proxy",
   "logFile": "",

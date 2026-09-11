@@ -1,12 +1,18 @@
-version: "3.9"
-
 services:
   proxy:
     build: .
     ports:
+      # 宿主端口 → 容器内固定 3050，可用 PROXY_PORT 自定义宿主侧
       - "${PROXY_PORT:-3050}:3050"
     environment:
+      # 容器内端口固定 3050：环境变量优先级高于挂载的 config.json（见 README「Docker 部署」）
       PORT: "3050"
+      HOST: "0.0.0.0"
+    volumes:
+      # 挂载本地配置，提供 proxyKey / apiKey
+      # ⚠️ 首次部署先执行：cp config.json.example config.json
+      #    若宿主该文件不存在，Docker 会创建同名**目录**，导致配置加载失败并回退到内置默认值
+      - ./config.json:/app/config.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]

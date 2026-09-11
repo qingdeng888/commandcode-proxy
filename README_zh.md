@@ -13,11 +13,14 @@
 ## 快速开始
 
 ```bash
-npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）
-npm run dev      # watch 模式（文件修改自动重启）
+cp config.json.example config.json   # 首次：复制配置模板再按需修改
+npm start        # 启动（默认监听 http://0.0.0.0:3050）
+npm run dev      # watch 模式（proxy.mjs 与 config.json 修改自动重启）
 ```
 
-API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
+> 仓库只提供 `config.json.example` 模板，**不含 `config.json`**。若未复制，程序会回退到内置默认值（端口 `3000`、无访问保护、无上游 Key）。
+
+未启用访问保护时，API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
 
 ```bash
 curl http://127.0.0.1:3050/v1/chat/completions \
@@ -30,7 +33,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ```
 commandcode/
-├── config.json           # 端口 / 日志路径等
+├── config.json.example   # 配置模板（复制为 config.json 后修改）
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # 单文件核心代理（~1900 行）
@@ -49,13 +52,16 @@ commandcode/
 
 ### config.json
 
+从模板复制后修改：`cp config.json.example config.json`。该文件已被 `.gitignore` 排除，不会误提交。
+
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `port` | `3000` | 监听端口（仓库自带 config.json 为 3050） |
+| `port` | `3000` | 监听端口（模板 `config.json.example` 中使用 `3050`） |
 | `host` | `0.0.0.0` | 监听地址 |
 | `apiBase` | `https://api.commandcode.ai` | CC API 地址 |
 | `projectSlug` | `cc-proxy` | `x-project-slug` header |
-| `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
+| `proxyKey` | `""` | 本地访问口令。**非空即启用严格鉴权**：客户端只认它，上游凭证从 `apiKey` 列表随机选取（详见「访问保护」） |
+| `apiKey` | `""` | 上游 CC API Key（`user_` 开头），**支持单个字符串或字符串数组**（多 Key 随机轮询）。`proxyKey` 为空时忽略 |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
@@ -68,6 +74,8 @@ commandcode/
 |------|-----------------|
 | `PORT` | `port` |
 | `HOST` | `host` |
+| `PROXY_KEY` | `proxyKey` |
+| `CC_API_KEY` | `apiKey`（多个用英文逗号分隔） |
 | `CC_API_BASE` | `apiBase` |
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
@@ -84,6 +92,71 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+## 访问保护
+
+默认情况下代理**不做访问控制**：客户端在 `Authorization: Bearer <key>` 中携带自己的 `user_` Key，代理原样透传给上游。**监听 `0.0.0.0` 时任何人都能借用这套代理**。
+
+在 `config.json` 中填入 `proxyKey` 即启用**严格模式**，把「客户端凭证」与「上游凭证」彻底分离：
+
+```json
+{
+  "proxyKey": "your-proxy-key",
+  "apiKey": ["user_你的Key1", "user_你的Key2"]
+}
+```
+
+| | 未启用（`proxyKey` 为空） | 启用后 |
+|---|---|---|
+| 客户端凭证 | 自己的 `user_` Key，透传上游 | 只需 `proxyKey` |
+| 上游凭证 | 来自客户端 | 从 `apiKey` 列表随机选取，客户端无法覆盖 |
+| `/v1/models` | 无凭证也返回（静态列表） | 同样要求 `proxyKey` |
+
+鉴权失败响应：
+
+| 场景 | 状态码 | 消息 |
+|------|--------|------|
+| 未带凭证 | `401` | `Missing API key. Send in Authorization: Bearer <key> or x-api-key header` |
+| 凭证错误 | `401` | `Invalid API key` |
+| `apiKey` 未配置 | `500` | `Server upstream API key not configured` |
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Authorization: Bearer your-proxy-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+> 下游面板（new-api / one-api 等）只需把调用本代理的 Key 填为 `proxyKey` 的值，上游 `user_` Key 留在本机不外泄。
+
+### 多 Key 轮询
+
+`apiKey` 支持配置多个上游 Key（单个字符串或字符串数组），代理**随机选取**其中一个发送请求：
+
+```json
+{
+  "proxyKey": "your-proxy-key",
+  "apiKey": ["user_aaa", "user_bbb", "user_ccc"]
+}
+```
+
+也可用环境变量注入，多个以英文逗号分隔：
+
+```bash
+CC_API_KEY=user_aaa,user_bbb,user_ccc npm start
+```
+
+**选择策略**：随机 + 避让连续重复 —— 不会连续两次选中同一个 Key。`MAX_CONSECUTIVE_SAME_KEY = 8` 为兜底上限（仅当避让不可行时才可能触及）。实测 3 个 Key 下分布偏离均匀值 < 0.5%。
+
+**失败自动切换**：上游返回 `401/402/403/429/5xx` 时自动换下一个 Key 重试，单请求最多尝试 `min(Key 数量, 3)` 个；与请求本身相关的错误（如 `400`）不换 Key。
+
+> 每个 Key 拥有**独立的 session 与设备指纹**（`sessionStore`/`keyStateStore` 均按 Key 隔离），多 Key 之间互不污染。代价是每个新 Key 首次使用时会触发一次 fingerprint/lifecycle 初始化请求。
+
+### 安全提示
+
+- `proxyKey` 是明文口令，比对采用定长比较（防时序侧信道），但**传输不加密** —— 公网部署务必套 HTTPS 反向代理。
+- 日志不记录 `proxyKey` 与 `apiKey` 明文。
+- 修改 `config.json` 会自动触发热重载（`dev` 脚本已用 `--watch-path` 显式监听该文件）；`npm start` 无热重载。
 
 ## API 接口
 
@@ -429,8 +502,11 @@ CLI 发送图片的格式：
 每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+cp config.json.example config.json
+docker pull ghcr.io/qingdeng888/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  ghcr.io/qingdeng888/commandcode-proxy:latest
 ```
 
 每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
@@ -441,17 +517,40 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/comman
 docker compose up -d
 ```
 
-代理将在 `http://0.0.0.0:3050` 监听。通过 `PROXY_PORT` 自定义主机端口：
+代理将在宿主机 `http://0.0.0.0:3050` 监听（映射到容器内固定端口 `3050`）。通过 `PROXY_PORT` 自定义主机端口：
 
 ```bash
 PROXY_PORT=13050 docker compose up -d
 ```
 
+### 配置文件挂载
+
+**镜像内不包含 `config.json`** —— `proxyKey`、`apiKey`（多 Key）等配置必须通过挂载注入，否则容器会回退到内置默认值（**无访问保护、无上游 Key**）：
+
+```yaml
+volumes:
+  - ./config.json:/app/config.json:ro
+```
+
+首次部署**必须**先复制模板 —— 否则 Docker 会把不存在的宿主路径创建成同名目录：
+
+```bash
+cp config.json.example config.json
+```
+
+`docker compose` 已默认挂载该文件；裸 `docker run` 需自行加 `-v`。
+
+> ⚠️ **宿主机的 `config.json` 必须已存在**。若不存在，Docker 会把它创建成一个**同名目录**，容器内 `readFileSync` 报 `EISDIR`，配置加载失败并回退到默认值（日志中会有 `[config] Failed to parse config.json` 提示）。
+>
+> ⚠️ **容器内端口恒为 `3050`**：`Dockerfile` 与 `docker-compose.yml` 都设置了 `PORT=3050` 环境变量，而环境变量的优先级**高于** `config.json` 的 `port` 字段。因此挂载配置文件里的 `port` 字段不会改变容器内监听端口 —— 对外端口由 `PROXY_PORT`（主机侧映射）决定。
+
 ### 从源码构建
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d -p 3050:3050 -e PORT=3050 \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  commandcode-proxy:latest
 ```
 
 ### 多架构构建
@@ -464,8 +563,10 @@ npm run docker:build:multi
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `PORT` | `3050` | 容器内监听端口 |
+| `PORT` | `3050` | 容器内监听端口（优先级高于 `config.json` 的 `port`） |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
+| `PROXY_KEY` | 空 | 本地访问口令，等价于 `config.json` 的 `proxyKey` |
+| `CC_API_KEY` | 空 | 上游 API Key，多个用英文逗号分隔，等价于 `config.json` 的 `apiKey` |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |

@@ -1,6 +1,8 @@
 node_modules/
 *.log
 *.zip
+# 本地配置：由 config.json.example 复制而来，含 proxyKey / apiKey，不应入库
+config.json
 .omo/
 .agents/
 AGENTS.md
