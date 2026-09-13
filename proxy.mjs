@@ -262,8 +262,10 @@ setInterval(() => {
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
 }, 60 * 60 * 1000); // 每小时
 
-function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
-  // 优先从客户端传来的 session 类 header 获取
+function resolveSessionId(incomingHeaders, apiKey, promptCacheKey) {
+  // 下游传来的会话标识一律原样透传：它同时决定上游的缓存命名空间，
+  // 一旦被代理替换成自生成的值，同一会话此前累积的前缀缓存就再难命中。
+  // 故此只判非空，不设长度门槛 —— 客户端给出什么就用什么。
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
@@ -271,10 +273,11 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
     promptCacheKey,
   ];
   for (const id of candidates) {
-    if (id && typeof id === 'string' && id.length >= 8) return id;
+    const v = typeof id === 'string' ? id.trim() : '';
+    if (v) return { id: v, source: 'client' };
   }
-  // 按 API Key 分 session
-  return ensureSession(apiKey);
+  // 客户端未提供：退回按 API Key 分 session
+  return { id: ensureSession(apiKey), source: 'generated' };
 }
 
 // 每个请求独立 thread ID
@@ -539,11 +542,16 @@ function buildCcRequest(openaiReq) {
     return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
+  // 下游给了 prompt_cache_key 就补一个缓存断点，保证前缀缓存真的被上游标记。
+  // 打在「最后一条 user 消息的最后一个 text part」上，取的是当前对话前缀的末端，
+  // 历史轮次自然落在缓存前缀之内 —— 只打第一条 user 消息会让后续轮次的增量
+  // 始终处于断点之外，长会话命中率反而低。
+  // 客户端自己带了 cache_control 就完全尊重客户端，不重复打点。
   const hasMessageCacheMarker = ccMessages.some(msg =>
     Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
   if (prompt_cache_key && !hasMessageCacheMarker) {
-    const firstUserMessage = ccMessages.find(msg => msg.role === 'user' && Array.isArray(msg.content));
-    const cacheBoundary = firstUserMessage?.content.findLast(part => part?.type === 'text');
+    const lastUserMessage = ccMessages.findLast(msg => msg.role === 'user' && Array.isArray(msg.content));
+    const cacheBoundary = lastUserMessage?.content.findLast(part => part?.type === 'text');
     if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
   }
 
@@ -1051,7 +1059,7 @@ function sendAuthError(res, code, anthropicStyle = false) {
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  const { id: sessionId, source: sessionSource } = resolveSessionId(incomingHeaders, apiKey, promptCacheKey);
 
   const headers = {
     'Content-Type': 'application/json',
@@ -1068,6 +1076,13 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   if (CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1') {
     headers['x-cmd-zdr'] = '1';
   }
+
+  // 会话 ID 决定上游的缓存命名空间，此处记录一次以便确认「客户端传的有没有透传出去」
+  log('info', 'Forwarding to CC', {
+    model: body?.params?.model,
+    sessionId,
+    sessionSource,
+  });
 
   const response = await fetch(url, {
     method: 'POST',
@@ -1183,6 +1198,21 @@ async function handleChatCompletions(req, res) {
   let reader = null;
   let translator = null;
 
+  // 记录本次用量，缓存是否命中可直接由此判断。三条终态分支（上游报错、零输出、
+  // 正常完成）都要记 —— 零输出时最需要看清的就是缓存到底有没有命中。
+  const logUsage = () => {
+    log('info', 'Request completed', {
+      path: '/v1/chat/completions',
+      model,
+      streaming: true,
+      elapsedMs: Date.now() - startTime,
+      id: completionId,
+      inputTokens: translator?.inputTokens ?? 0,
+      outputTokens: translator?.outputTokens ?? 0,
+      cachedInputTokens: translator?.cachedInputTokens ?? 0,
+    });
+  };
+
   try {
     // 转发到 CC API（传入客户端 headers 用于提取 session ID；遇 Key 失效/限流自动换 Key 重试）
     const { response: ccResponse } = await forwardWithKeyRetry(
@@ -1289,7 +1319,6 @@ async function handleChatCompletions(req, res) {
         if (!aborted) {
           // 成功完成一次请求，重置连续超时计数
           consecutiveTimeouts = 0;
-          // 处理剩余 buffer
           if (buffer.trim()) {
             const events = translator.parseLine(buffer);
             if (events) {
@@ -1299,6 +1328,7 @@ async function handleChatCompletions(req, res) {
             }
           }
           if (translator.upstreamError) {
+            logUsage();
             if (!started) {
               sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
               return;
@@ -1306,6 +1336,7 @@ async function handleChatCompletions(req, res) {
             try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
+            logUsage();
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -1323,6 +1354,7 @@ async function handleChatCompletions(req, res) {
               started = true;
             }
             res.write(translator.getDoneEvent());
+            logUsage();
           }
         }
       } catch (e) {
@@ -1380,6 +1412,21 @@ async function handleChatCompletions(req, res) {
       let usage = null;
       let toolCalls = null;
       let upstreamError = null;
+
+      // 记录本次用量，缓存是否命中可直接由此判断。
+      // 三条终态分支（上游报错、零输出、正常完成）都要记。
+      const logNonStreamUsage = () => {
+        log('info', 'Request completed', {
+          path: '/v1/chat/completions',
+          model,
+          streaming: false,
+          elapsedMs: Date.now() - startTime,
+          id: completionId,
+          inputTokens: usage?.inputTokens ?? 0,
+          outputTokens: usage?.outputTokens ?? 0,
+          cachedInputTokens: usage?.cachedInputTokens ?? 0,
+        });
+      };
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1444,12 +1491,14 @@ async function handleChatCompletions(req, res) {
       processLines();
 
       if (upstreamError) {
+        logNonStreamUsage();
         sendJSON(res, upstreamError.status, upstreamError.body);
         return;
       }
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
+        logNonStreamUsage();
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
         return;
@@ -1481,6 +1530,7 @@ async function handleChatCompletions(req, res) {
       };
     })(),
       });
+      logNonStreamUsage();
     }
   } catch (e) {
     if (abortController.signal.aborted) {
