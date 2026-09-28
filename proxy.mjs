@@ -467,6 +467,29 @@ const catalog = createModelCatalog({
 const modelState = createModelState({ log: (...args) => log(...args) });
 
 /**
+ * 客户端没指定 model 时的兜底选择。
+ *   1) 后台配的「默认测试模型」（若它启用且在目录中）—— 用户显式指定的意图优先；
+ *   2) 目录里第一个启用、且支持该端点的模型；
+ *   3) 目录里第一个启用的模型；
+ *   4) 最后才退回写死的 id（目录不可用时的保险）。
+ *
+ * 之前三处都是直接写死 'deepseek/deepseek-v4-flash' / 'claude-sonnet-4-6'：
+ * 一旦后台把那个模型禁用了，不带 model 的请求就会莫名其妙地 400。
+ */
+function fallbackModel(hardcoded, endpoint = null) {
+  const enabled = modelState.filterEnabled(catalog.list());
+  if (CFG.defaultModel && modelState.isEnabled(CFG.defaultModel) && catalog.get(CFG.defaultModel)) {
+    return CFG.defaultModel;
+  }
+  if (endpoint) {
+    const fit = enabled.find(m => !m.supportedEndpoints || m.supportedEndpoints.includes(endpoint));
+    if (fit) return fit.id;
+  }
+  if (enabled.length) return enabled[0].id;
+  return hardcoded;
+}
+
+/**
  * 是否允许使用该模型。只拦「明确被禁用」的模型；
  * 目录里没有的模型仍照旧透传（目录可能过期，不能因此把能用的请求拦掉）。
  * 返回 null 表示放行，否则返回给下游的错误说明。
@@ -490,9 +513,16 @@ function disabledModelError(requestedModel) {
 // 两边各写一遍迟早会不一致。
 const DEFAULT_TEST_MESSAGE = '你是谁，出来干活了';
 const MAX_TEST_MESSAGE_LEN = 4000;
-// 探测回复只用于展示「有没有正常出字」，不必读完；但太短会把正常回答截得像故障
-const PROBE_MAX_TOKENS = 256;
-const PROBE_PREVIEW_CHARS = 500;
+
+// 探测要收多少回复，分两种场景（这是刻意的差异）：
+//   single —— 后台手点的单次测试：目的就是「看看这个模型到底回了什么」，
+//             所以给足 token 与字符，别把正常回答截得像故障；
+//   batch  —— 一次性跑几十上百个模型，只为分类（通/不通/没额度），
+//             每个都收长篇会既慢又贵，所以只收一小段。
+const PROBE_LIMITS = {
+  single: { maxTokens: 1024, maxChars: 3000 },
+  batch: { maxTokens: 64, maxChars: 400 },
+};
 
 /** 归一化测试消息：空/非字符串 → 默认值；过长 → 报错（由调用方转成 400） */
 function normalizeTestMessage(message) {
@@ -506,8 +536,12 @@ function normalizeTestMessage(message) {
   return { ok: true, text };
 }
 
-/** 读探测响应流，取回一小段文本。限时 + 限字节，避免探测把连接挂死。 */
-async function consumeProbeStream(response, timeoutMs = 45000) {
+/**
+ * 读探测响应流，取回模型回答。限时 + 限字节，避免探测把连接挂死。
+ * 同时取出 finishReason 与用量 —— 回答被截断时，「为什么短」本身就是要看的信息
+ * （finishReason=max_tokens 说明是 token 上限，不是模型不肯说话）。
+ */
+async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000 } = {}) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const deadline = Date.now() + timeoutMs;
@@ -515,6 +549,8 @@ async function consumeProbeStream(response, timeoutMs = 45000) {
   let text = '';
   let streamError = null;
   let sawFinish = false;
+  let finishReason = null;
+  let usage = null;
   let bytes = 0;
 
   try {
@@ -534,17 +570,21 @@ async function consumeProbeStream(response, timeoutMs = 45000) {
         if (ev.type === 'text-delta' && typeof ev.text === 'string') text += ev.text;
         else if (ev.type === 'error') {
           streamError = ev.error?.message || ev.error?.code || JSON.stringify(ev.error || ev);
-        } else if (ev.type === 'finish') sawFinish = true;
+        } else if (ev.type === 'finish') {
+          sawFinish = true;
+          if (ev.finishReason) finishReason = ev.finishReason;
+          if (ev.totalUsage) usage = ev.totalUsage;
+        }
       }
 
       // 已经有结论就不必把整个流读完
-      if (streamError || sawFinish || text.length > PROBE_PREVIEW_CHARS || bytes > 512 * 1024) break;
+      if (streamError || sawFinish || text.length > maxChars || bytes > 512 * 1024) break;
     }
   } finally {
     try { await reader.cancel(); } catch {}
   }
 
-  return { text, streamError, sawFinish, bytes };
+  return { text, streamError, sawFinish, finishReason, usage, bytes };
 }
 
 /**
@@ -552,9 +592,10 @@ async function consumeProbeStream(response, timeoutMs = 45000) {
  * message 省略时用 DEFAULT_TEST_MESSAGE（与参考项目一致的「你是谁，出来干活了」）。
  * 返回 { model, ok, category, latencyMs, httpStatus, message, outputPreview, prompt }
  */
-async function probeModel({ key, model, message }) {
+async function probeModel({ key, model, message, mode = 'single' }) {
   const started = Date.now();
   const elapsed = () => Date.now() - started;
+  const limits = PROBE_LIMITS[mode] || PROBE_LIMITS.single;
 
   const norm = normalizeTestMessage(message);
   if (!norm.ok) {
@@ -567,7 +608,7 @@ async function probeModel({ key, model, message }) {
     ccBody = buildCcRequest({
       model,
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: PROBE_MAX_TOKENS,
+      max_tokens: limits.maxTokens,
       stream: true,
     });
   } catch (e) {
@@ -592,7 +633,7 @@ async function probeModel({ key, model, message }) {
       };
     }
 
-    const { text, streamError, sawFinish } = await consumeProbeStream(response);
+    const { text, streamError, sawFinish, finishReason, usage } = await consumeProbeStream(response, { maxChars: limits.maxChars });
 
     if (streamError) {
       const category = classifyProbe({ ok: false, bodyText: String(streamError) });
@@ -606,14 +647,28 @@ async function probeModel({ key, model, message }) {
 
     // 有文本或有 finish 事件即认为该模型可用；两者都没有说明是零输出
     const ok = text.length > 0 || sawFinish;
+    // 回答被截断时把原因说清楚：是 token 上限，还是上游本来就这么短
+    const truncated = finishReason === 'max_tokens' || text.length > limits.maxChars;
+    let note = ok ? '链路正常' : '上游返回 200 但没有任何输出';
+    if (ok && truncated) {
+      note = finishReason === 'max_tokens'
+        ? `链路正常（回答达到 token 上限被截断，上限 ${limits.maxTokens}）`
+        : '链路正常（回答较长，仅显示前一段）';
+    }
     return {
       model,
       ok,
       category: ok ? 'ok' : 'error',
       latencyMs: elapsed(),
       httpStatus: 200,
-      message: ok ? '链路正常' : '上游返回 200 但没有任何输出',
-      outputPreview: summarizeUpstreamError(text, PROBE_PREVIEW_CHARS),
+      message: note,
+      // output 只在单次测试时返回：模型页/批量测试看的是分类，不需要回答正文，
+      // 带上它只会把结果列表和 model-tests.json 撑大。
+      output: mode === 'batch' ? '' : text,
+      outputPreview: summarizeUpstreamError(text, 200),
+      finishReason: finishReason || null,
+      usage: usage || null,
+      truncated,
       prompt,
     };
   } catch (e) {
@@ -647,7 +702,8 @@ const modelTestRunner = createModelTestRunner({
     if (!key) {
       return { model, ok: false, category: 'error', latencyMs: null, httpStatus: null, message: '没有可用的 Key', keyId, checkedAt: new Date().toISOString() };
     }
-    const r = await probeModel({ key, model, message });
+    // 批量用 batch 限额：只为分类，收长篇既慢又贵
+    const r = await probeModel({ key, model, message, mode: 'batch' });
     return { ...r, keyId: keyId || keyPool.idForKey(key), checkedAt: new Date().toISOString() };
   },
 });
@@ -1732,7 +1788,7 @@ async function handleChatCompletions(req, res) {
   const apiKey = auth.upstreamKey;
 
   const stream = openaiReq.stream === true;
-  const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
+  const model = openaiReq.model || fallbackModel('deepseek/deepseek-v4-flash', '/chat/completions');
   // 明确被禁用的模型直接拒掉：只在 /v1/models 里隐藏它是不够的 ——
   // 客户端缓存了模型名照样能调，禁用就成了摆设
   const disabledErr = disabledModelError(openaiReq.model);
@@ -1742,6 +1798,11 @@ async function handleChatCompletions(req, res) {
   }
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
+
+  // 把「解析出来的 model」写回请求对象。
+  // buildCcRequest 内部是从 openaiReq.model 取值的，不写回去的话，
+  // 上面 fallbackModel() 算出的兜底模型只会进入日志，实际发出去的仍是写死的那个 id。
+  openaiReq.model = model;
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
@@ -2684,7 +2745,7 @@ async function handleMessages(req, res) {
   const apiKey = auth.upstreamKey;
 
   const stream = anthropicReq.stream === true;
-  const model = anthropicReq.model || 'claude-sonnet-4-6';
+  const model = anthropicReq.model || fallbackModel('claude-sonnet-4-6', '/messages');
   const disabledErr = disabledModelError(anthropicReq.model);
   if (disabledErr) {
     sendAnthropicError(res, 400, 'invalid_request_error', disabledErr);
@@ -2693,6 +2754,8 @@ async function handleMessages(req, res) {
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
+  // 同 chat：buildCcRequest 读的是这个对象的 model，兜底结果必须写回去才生效
+  openaiReq.model = model;
   const ccBody = buildCcRequest(openaiReq);
 
   const abortController = new AbortController();
@@ -3491,7 +3554,7 @@ async function handleResponses(req, res) {
   }
 
   const stream = chatReq.stream === true;
-  const model = chatReq.model || 'deepseek/deepseek-v4-flash';
+  const model = chatReq.model || fallbackModel('deepseek/deepseek-v4-flash', '/chat/completions');
   const disabledErr = disabledModelError(chatReq.model);
   if (disabledErr) {
     sendResponsesError(res, 400, 'invalid_request_error', disabledErr);
@@ -3508,6 +3571,8 @@ async function handleResponses(req, res) {
     tool_choice: typeof respReq.tool_choice === 'string' ? respReq.tool_choice : 'auto',
     tools: respReq.tools || [],
   };
+  // 同上：兜底模型要写回，否则省略 model 时发出去的仍是写死的 id
+  chatReq.model = model;
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
   chatReq = null;

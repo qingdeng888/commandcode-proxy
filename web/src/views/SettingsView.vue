@@ -160,12 +160,17 @@ onMounted(() => {
             </select>
           </div>
           <div class="field">
-            <label>默认模型</label>
+            <label>默认测试模型</label>
             <select v-model="form.defaultModel">
-              <option value="">（未设置）</option>
+              <option value="">（未设置 —— 自动取第一个启用的模型）</option>
               <option v-for="m in modelOptions" :key="m" :value="m">{{ m }}</option>
             </select>
           </div>
+        </div>
+        <div class="hint" style="margin-bottom: 10px">
+          「仪表盘 → 上游连通性测试」的模型下拉会**自动预选**这里设置的模型；
+          你仍然可以在下拉里临时选别的模型来测。未设置时取第一个**启用**的模型。
+          另外，客户端调用 <code>/v1/*</code> 时如果没有指定 <code>model</code>，也会用它作为兜底。
         </div>
 
         <div class="form-row">

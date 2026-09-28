@@ -274,7 +274,7 @@ test('环境变量来源的 Key 只读，可导入为可管理条目', async () 
 // ── ⑧ 模型目录与模型测试 ─────────────────────────────
 
 /** 一个会为 /provider/v1/models 返回真实目录、其余走 NDJSON 的 mock 上游 */
-async function startCatalogUpstream({ generateStatus = 200, generateBody = null, models = null } = {}) {
+async function startCatalogUpstream({ generateStatus = 200, generateBody = null, models = null, ndjson = null } = {}) {
   const port = await allocPort();
   const seen = [];
   const server = http.createServer((req, res) => {
@@ -301,9 +301,11 @@ async function startCatalogUpstream({ generateStatus = 200, generateBody = null,
         return;
       }
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-      res.write('{"type":"text-start"}\n');
-      res.write('{"type":"text-delta","text":"hi"}\n');
-      res.write('{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":3,"outputTokens":1}}\n');
+      for (const line of (ndjson ?? [
+        '{"type":"text-start"}',
+        '{"type":"text-delta","text":"hi"}',
+        '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":3,"outputTokens":1}}',
+      ])) res.write(line + '\n');
       res.end();
     });
   });
@@ -322,6 +324,12 @@ async function startCatalogUpstream({ generateStatus = 200, generateBody = null,
         const part = body?.params?.messages?.[0]?.content?.[0];
         return part?.text ?? null;
       } catch { return null; }
+    },
+    /** 上游实际收到的信封里用的 model（验证「省略 model 时的兜底」） */
+    lastWireModel: () => {
+      const g = seen.filter(s => s.url === '/alpha/generate').pop();
+      if (!g) return null;
+      try { return JSON.parse(g.raw)?.params?.model ?? null; } catch { return null; }
     },
     /** 所有探测请求收到的提示词，按顺序 */
     allPrompts: () => seen
@@ -347,6 +355,151 @@ test('模型目录来自上游，并保留 contextLength 与 supportedEndpoints'
     assert.deepEqual(ds.supportedEndpoints, ['/chat/completions', '/responses']);
     assert.equal(ds.source, 'upstream');
     assert.ok(data.lastSyncAt, '应记录同步时间');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('单次模型测试返回模型的完整回答；批量结果保持紧凑不带正文', async () => {
+  const longReply = '这是一段用于验证完整返回的较长回答。'.repeat(60);   // 约 1000+ 字符
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    `{"type":"text-delta","text":"${longReply}"}`,
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":7,"outputTokens":321}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    const model = list.models[0].id;
+
+    // 单次测试：要给到模型的实际回答（仪表盘要展示）
+    const single = (await (await api.post('/models/test', { model })).json()).data;
+    assert.ok(single.output && single.output.length > 900,
+      `单次测试应返回完整回答，实际 ${single.output ? single.output.length : 0} 字符`);
+    assert.ok(single.output.startsWith('这是一段用于验证完整返回'), '回答内容要原样返回');
+    assert.ok(single.outputPreview.length < single.output.length,
+      'outputPreview 应是明显短于正文的压缩版本');
+    assert.equal(single.finishReason, 'stop', '应带出结束原因');
+    assert.deepEqual(single.usage, { inputTokens: 7, outputTokens: 321 }, '应带出 token 用量');
+    assert.equal(single.truncated, false);
+
+    // Key 测试同样返回回答
+    const kid = (await (await api.post('/keys', { key: 'user_outputcheck0000000000000', label: 'O' })).json()).data.key.id;
+    const viaKey = (await (await api.post('/keys/test', { id: kid })).json()).data;
+    assert.ok(viaKey.output && viaKey.output.length > 900, 'Key 测试也应返回完整回答');
+
+    // 批量：只为分类，不带正文（否则结果列表与 model-tests.json 会被撑大）
+    const started = await api.post('/models/test-batch', { models: [model], concurrency: 1 });
+    assert.equal(started.status, 200);
+    for (let i = 0; i < 40; i++) {
+      const st = (await (await api.get('/models/test-status')).json()).data;
+      if (!st.running && st.done >= 1) break;
+      await new Promise(r => setTimeout(r, 150));
+    }
+    const st = (await (await api.get('/models/test-status')).json()).data;
+    assert.equal(st.results.length, 1);
+    assert.ok(!st.results[0].output, '批量结果不应携带回答正文');
+    assert.ok(st.results[0].outputPreview, '但应保留短预览');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('结束原因为 max_tokens 时明确标出回答被截断', async () => {
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"写到这里就被上限截断了"}',
+    '{"type":"finish","finishReason":"max_tokens","totalUsage":{"inputTokens":3,"outputTokens":1024}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    const d = (await (await api.post('/models/test', { model: list.models[0].id })).json()).data;
+    assert.equal(d.ok, true, '被 token 上限截断仍算链路正常');
+    assert.equal(d.truncated, true);
+    assert.equal(d.finishReason, 'max_tokens');
+    assert.match(d.message, /token 上限/, '说明里要讲清是被上限截断，而不是让用户以为模型坏了');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('只允许测试启用中的模型（服务端强制，不只是下拉过滤）', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    const [m1, m2] = list.models.map(m => m.id);
+    await api.post('/models/disable', { ids: [m2] });
+
+    // 单模型测试：直接构造请求也不行
+    const single = await api.post('/models/test', { model: m2 });
+    assert.equal(single.status, 400);
+    assert.match((await single.json()).error, /已被禁用/);
+
+    const keyTest = await api.post('/keys/test', { key: CATALOG_KEY, model: m2 });
+    assert.equal(keyTest.status, 400);
+    assert.match((await keyTest.json()).error, /已被禁用/);
+
+    // 未指定模型时自动挑的是启用中的那个，不受影响
+    const auto = await api.post('/keys/test', { key: CATALOG_KEY });
+    assert.equal(auto.status, 200);
+    assert.equal((await auto.json()).data.model, m1, '自动选择应落在启用中的模型上');
+
+    // 批量：显式带上禁用模型会被剔除并如实回报，而不是静默少测
+    const batch = await api.post('/models/test-batch', { models: [m1, m2], concurrency: 1 });
+    assert.equal(batch.status, 200);
+    const batchBody = await batch.json();
+    assert.equal(batchBody.data.total, 1);
+    assert.deepEqual(batchBody.data.skipped, [m2]);
+    assert.match(batchBody.message, /跳过 1 个被禁用的模型/);
+    for (let i = 0; i < 40; i++) {
+      const st = (await (await api.get('/models/test-status')).json()).data;
+      if (!st.running && st.done >= 1) break;
+      await new Promise(r => setTimeout(r, 150));
+    }
+
+    // 全部被禁用时批量测试直接报错，并说明原因
+    await api.post('/models/disable', { all: true });
+    const allDisabled = await api.post('/models/test-batch', { models: [m1, m2] });
+    assert.equal(allDisabled.status, 400);
+    assert.match((await allDisabled.json()).error, /都已被禁用/);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('省略 model 时按「默认测试模型 → 第一个启用模型」兜底，不再写死', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  const H = { Authorization: `Bearer ${CATALOG_KEY}` };
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    const [m1, m2] = list.models.map(m => m.id);
+
+    // 设默认测试模型为 m2 → 不带 model 的请求应使用 m2
+    await api.post('/config/update', { defaultModel: m2 });
+    await proxy.post('/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] }, H);
+    assert.equal(upstream.lastWireModel(), m2, '省略 model 时应使用默认测试模型');
+
+    // 把 m2 禁用 → 兜底应退到第一个启用模型 m1，而不是写死的那个 id
+    await api.post('/models/disable', { ids: [m2] });
+    await proxy.post('/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] }, H);
+    assert.equal(upstream.lastWireModel(), m1, '默认模型被禁用后应退到第一个启用模型');
+
+    // 三条数据面路径都走同一套兜底
+    await proxy.post('/v1/messages', { max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }, { 'x-api-key': CATALOG_KEY });
+    assert.equal(upstream.lastWireModel(), m1, 'Anthropic 路径同样兜底');
+    await proxy.post('/v1/responses', { input: 'hi' }, H);
+    assert.equal(upstream.lastWireModel(), m1, 'Responses 路径同样兜底');
   } finally { await proxy.kill(); await upstream.close(); }
 });
 

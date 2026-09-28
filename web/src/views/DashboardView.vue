@@ -61,11 +61,27 @@ const strategyText = computed(() => STRATEGY_LABELS[d.value.strategy] || d.value
 const modelOptions = computed(() => models.list || [])
 const keyOptions = computed(() => keysState.list || [])
 
+// 下拉里只列**启用**的模型：被禁用的模型测了也是 400，列出来徒增困惑
+const selectableModels = computed(() => modelOptions.value.filter((m) => m.enabled !== false))
+
+/**
+ * 预选测试模型：
+ *  1) 优先用「设置」里配的默认测试模型（models.defaultModel，后端已保证它是启用中的最新值）；
+ *  2) 没配就取第一个启用的模型；
+ *  3) 用户在下面自己改过就不覆盖（只有当前值不在可选列表里时才重新预选）。
+ */
+function preselectTestModel() {
+  const list = selectableModels.value
+  if (!list.length) return
+  const preferred = models.defaultModel
+  const stillValid = testModel.value && list.some((m) => m.id === testModel.value)
+  if (stillValid) return
+  testModel.value = (preferred && list.some((m) => m.id === preferred)) ? preferred : list[0].id
+}
+
 watch(
-  () => models.list.length,
-  () => {
-    if (!testModel.value && models.list.length) testModel.value = models.list[0].id
-  },
+  () => [models.list.length, models.defaultModel],
+  preselectTestModel,
   { immediate: true },
 )
 
@@ -234,8 +250,10 @@ onUnmounted(() => {
           <div class="field">
             <label>测试模型</label>
             <select v-model="testModel">
-              <option v-if="!modelOptions.length" value="">（暂无模型，请先刷新模型目录）</option>
-              <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ m.id }}</option>
+              <option v-if="!selectableModels.length" value="">（没有启用的模型，请先同步并启用）</option>
+              <option v-for="m in selectableModels" :key="m.id" :value="m.id">
+                {{ m.id }}{{ m.id === models.defaultModel ? '（默认）' : '' }}
+              </option>
             </select>
           </div>
           <div class="field">

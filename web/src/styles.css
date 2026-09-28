@@ -274,3 +274,6 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
 .col-check input[type=checkbox]{cursor:pointer;width:15px;height:15px;accent-color:var(--accent);vertical-align:middle}
 tr.row-disabled td{opacity:.55}
 tr.row-disabled td.col-check,tr.row-disabled td:last-child{opacity:1}
+
+/* 模型回答：完整展示但要限高，避免长回答把页面撑爆 */
+.reply-text{max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:6px 0 0}
