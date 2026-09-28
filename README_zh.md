@@ -60,7 +60,8 @@ commandcode/
 │   └── dist/             # 构建产物（由 npm run build:web 或 Docker 构建生成，不入库）
 ├── data/                 # 运行时数据（**不入库**）：Key 池、后台密码、模型测试结论
 ├── docs/
-│   └── admin-api.md      # 后台 API 契约（前后端唯一接口）
+│   ├── admin-api.md      # 后台 API 契约（前后端唯一接口）
+│   └── design-notes.md   # 设计约定（不要求 TLS、零运行时依赖、状态放 data/ 等）
 ├── test/                 # 测试（node:test，无需测试框架依赖）
 ├── config.json.example   # 配置模板（复制为 config.json 后修改）
 ├── Dockerfile            # 两阶段构建：先构建前端，再产出运行镜像
@@ -204,7 +205,8 @@ CC_API_KEY=user_aaa,user_bbb,user_ccc npm start
 
 ### 安全提示
 
-- `proxyKey` 是明文口令，比对采用定长比较（防时序侧信道），但**传输不加密** —— 公网部署务必套 HTTPS 反向代理。
+- `proxyKey` 是明文口令，比对采用定长比较（防时序侧信道）。与参考项目一致，本代理**不要求 TLS**：
+  局域网内自用无需任何额外处理，直接 `http://` 访问即可；只有确实要暴露到公网时，才需要自行套一层 HTTPS。
 - 日志不记录 `proxyKey` 与 `apiKey` 明文。
 - 修改 `config.json` 会自动触发热重载（`dev` 脚本已用 `--watch-path` 显式监听该文件）；`npm start` 无热重载。
 
