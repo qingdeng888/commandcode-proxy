@@ -3,6 +3,12 @@ node_modules/
 *.zip
 # 本地配置：由 config.json.example 复制而来，含 proxyKey / apiKey，不应入库
 config.json
+# 数据目录：keys.json 含上游 Key 明文、.admin-auth.json 含后台密码哈希，
+# 绝不能进版本控制；model-tests.json 与请求日志同理
+data/
+# 前端构建产物：由 npm run build:web 或 Docker 多阶段构建生成
+web/dist/
+web/node_modules/
 .omo/
 .agents/
 AGENTS.md

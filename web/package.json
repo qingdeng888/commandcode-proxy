@@ -1,0 +1,20 @@
+{
+  "name": "commandcode-proxy-admin-web",
+  "private": true,
+  "version": "1.1.0",
+  "type": "module",
+  "description": "Command Code 代理管理后台前端（Vue 3 + Vite）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.43",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.9",
+    "vite": "^7.3.6"
+  }
+}

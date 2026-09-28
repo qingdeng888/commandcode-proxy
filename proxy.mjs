@@ -8,70 +8,33 @@ import tls from 'tls';
 import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { appendFileSync } from 'fs';
 
-// ── 配置加载 ──────────────────────────────────────
-const __dirname = dirname(fileURLToPath(import.meta.url));
+// ── 本地模块 ──────────────────────────────────────
+// 配置 / 持久化 / Key 池 / 后台统统拆到 lib/ 下，本文件只保留数据面（转发）与进程装配。
+//
+// 热加载的两条约定：
+//   1) CFG 是**同一个对象**，lib/config.mjs 靠 Object.assign 原地改 —— 下面几百处
+//      `CFG.xxx` 读取无需改动，也不会出现「新旧两份配置」并存的窗口；
+//   2) Key 池在每次选 Key 时现取，后台改完立即生效，不需要重启也不需要 fs.watch。
+import { CFG, startConfigWatcher } from './lib/config.mjs';
+import { DATA_DIR } from './lib/store.mjs';
+import { createLogBus, levelEnabled } from './lib/logbus.mjs';
+import { createKeyPool } from './lib/keys.mjs';
+import { createAdminAuth } from './lib/admin-auth.mjs';
+import { createModelCatalog, createModelTestRunner, classifyProbe } from './lib/models.mjs';
+import { createAdminApi } from './lib/admin-api.mjs';
 
-function loadConfig() {
-  const defaults = {
-    port: 3000,
-    host: '0.0.0.0',
-    proxyKey: '',   // 本地访问口令：非空时启用严格鉴权（客户端只认它，上游固定用 apiKey）
-    apiKey: '',     // 上游 CC API Key：单个字符串或字符串数组（多 Key 随机轮询）
-    apiBase: 'https://api.commandcode.ai',
-    projectSlug: 'cc-proxy',
-    logFile: '',
-    logLevel: 'info',
-    useProviderModels: true,
-    modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
-    zdr: false,
-    cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
-    cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
-    fingerprintSalt: '',
-    deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
-    emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
-    upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
-  };
+const SERVER_STARTED_AT = Date.now();
 
-  const configPath = resolve(__dirname, 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      const user = JSON.parse(readFileSync(configPath, 'utf-8'));
-      Object.assign(defaults, user);
-    } catch (e) {
-      console.error('[config] Failed to parse config.json:', e.message);
-    }
-  }
+// 日志总线：给后台「请求日志」页 + SSE 实时推送用
+const logBus = createLogBus();
 
-  // 环境变量覆写
-  if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
-  if (process.env.HOST) defaults.host = process.env.HOST;
-  if (process.env.PROXY_KEY) defaults.proxyKey = process.env.PROXY_KEY;
-  if (process.env.CC_API_KEY) defaults.apiKey = process.env.CC_API_KEY.split(',');   // 逗号分隔多 Key
-  if (process.env.CC_API_BASE) defaults.apiBase = process.env.CC_API_BASE;
-  if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
-  if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
-  if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
-  if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
-  if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
-  if (process.env.CC_DEVICE_PROJECT_DIR) defaults.deviceProjectDir = process.env.CC_DEVICE_PROJECT_DIR;
-  if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
-  if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
-  if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
-  if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+// Key 池：视 UI Key + config/env Key 为一个轮询池
+const keyPool = createKeyPool({ log: (...args) => log(...args) });
 
-  // 归一化为 apiKeyList：兼容单个字符串或字符串数组，剔除空白项
-  defaults.apiKeyList = (Array.isArray(defaults.apiKey) ? defaults.apiKey : [defaults.apiKey])
-    .filter(k => typeof k === 'string' && k.trim())
-    .map(k => k.trim());
-
-  return defaults;
-}
-
-const CFG = loadConfig();
+// 后台鉴权（与数据面的 proxyKey 是两套独立凭证）
+const adminAuth = createAdminAuth({ log: (...args) => log(...args) });
 
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -284,12 +247,18 @@ let consecutiveTimeouts = 0;
 const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
+// CFG.logLevel 以前只是文档里的摆设（代码从不读它）。现在真正生效，
+// 并同时送进日志总线 —— 后台「请求日志」页与 SSE 推送都从那里取。
 function log(level, msg, data) {
-  const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
+  if (!levelEnabled(CFG.logLevel, level)) return;
+  const entry = { time: new Date().toISOString(), level, msg };
+  if (data !== undefined) entry.data = data;
+  const line = `[${entry.time}] [${level}] ${msg}${data !== undefined ? ' ' + JSON.stringify(data) : ''}`;
   console.log(line);
   if (CFG.logFile) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
+  logBus.push(entry);
 }
 
 // 把上游错误体摘要成单行，便于日志排查。
@@ -475,6 +444,161 @@ const MODELS = [
   { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
   { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
 ];
+
+// 模型目录：从 CC 上游 /provider/v1/models 拉取（实测 82 个模型，带 context_length 与
+// supported_endpoints）。拉取失败时回退到上面的静态列表，并标记 source:'static'，
+// 后台会把它显示出来 —— 静默用一份过期列表比报错更难排查。
+const catalog = createModelCatalog({
+  staticModels: MODELS,
+  log: (...args) => log(...args),
+  fetchImpl: (url, options) => upstreamFetch(url, {
+    ...options,
+    headers: { ...(options?.headers || {}), 'x-command-code-version': CC_VERSION },
+  }),
+});
+
+// ── 探测（Key 测试 / 模型测试）────────────────────────
+// 「模型测试」= 用指定 Key 对指定模型发一次真实最小请求，按上游返回的错误码归类。
+//
+// 为什么不用参考项目 Cline-proxy 的「余额差值探测」：那套方案依赖查询账户余额
+// （跑一次模型前后各查一次，掉余额=收费模型）。Command Code **没有任何余额/用量接口**
+// —— 实测 /provider/v1/usage、/provider/v1/balance、/api/v1/users/me 全部 404。
+// 因此改为就地判定：能不能跑通、因为什么跑不通，由上游错误码直接回答。
+
+/** 读探测响应流，取回一小段文本。限时 + 限字节，避免探测把连接挂死。 */
+async function consumeProbeStream(response, timeoutMs = 45000) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  let buffer = '';
+  let text = '';
+  let streamError = null;
+  let sawFinish = false;
+  let bytes = 0;
+
+  try {
+    while (Date.now() < deadline) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value?.length || 0;
+      buffer += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'text-delta' && typeof ev.text === 'string') text += ev.text;
+        else if (ev.type === 'error') {
+          streamError = ev.error?.message || ev.error?.code || JSON.stringify(ev.error || ev);
+        } else if (ev.type === 'finish') sawFinish = true;
+      }
+
+      // 已经有结论就不必把整个流读完
+      if (streamError || sawFinish || text.length > 200 || bytes > 512 * 1024) break;
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
+
+  return { text, streamError, sawFinish, bytes };
+}
+
+/**
+ * 对指定 Key + 模型做一次真实探测。
+ * 返回 { model, ok, category, latencyMs, httpStatus, message, outputPreview }
+ */
+async function probeModel({ key, model }) {
+  const started = Date.now();
+  const elapsed = () => Date.now() - started;
+
+  let ccBody;
+  try {
+    ccBody = buildCcRequest({
+      model,
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 16,
+      stream: true,
+    });
+  } catch (e) {
+    return { model, ok: false, category: 'error', latencyMs: elapsed(), httpStatus: null, message: `构造请求失败: ${e.message}` };
+  }
+
+  try {
+    await ensureInitialized(key);
+    const response = await forwardToCC(ccBody, key, {}, null, null);
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      const category = classifyProbe({ ok: false, httpStatus: response.status, bodyText: body });
+      return {
+        model,
+        ok: false,
+        category,
+        latencyMs: elapsed(),
+        httpStatus: response.status,
+        message: summarizeUpstreamError(body, 200) || `HTTP ${response.status}`,
+      };
+    }
+
+    const { text, streamError, sawFinish } = await consumeProbeStream(response);
+
+    if (streamError) {
+      const category = classifyProbe({ ok: false, bodyText: String(streamError) });
+      return {
+        model, ok: false, category: category === 'error' ? 'error' : category,
+        latencyMs: elapsed(), httpStatus: 200,
+        message: summarizeUpstreamError(String(streamError), 200),
+      };
+    }
+
+    // 有文本或有 finish 事件即认为该模型可用；两者都没有说明是零输出
+    const ok = text.length > 0 || sawFinish;
+    return {
+      model,
+      ok,
+      category: ok ? 'ok' : 'error',
+      latencyMs: elapsed(),
+      httpStatus: 200,
+      message: ok ? '链路正常' : '上游返回 200 但没有任何输出',
+      outputPreview: summarizeUpstreamError(text, 200),
+    };
+  } catch (e) {
+    const isTimeout = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    return {
+      model,
+      ok: false,
+      category: classifyProbe({ networkError: e }),
+      latencyMs: elapsed(),
+      httpStatus: null,
+      message: `${isTimeout ? '超时' : '连接失败'}: ${e.message}`,
+    };
+  }
+}
+
+// 批量模型测试任务（受限并发 + 可取消），进度由后台轮询
+const modelTestRunner = createModelTestRunner({
+  log: (...args) => log(...args),
+  probe: async ({ model, keyId }) => {
+    let key = null;
+    if (keyId) {
+      const entry = keyPool.findById(keyId);
+      if (!entry) {
+        return { model, ok: false, category: 'error', latencyMs: null, httpStatus: null, message: '指定的 Key 不存在', keyId, checkedAt: new Date().toISOString() };
+      }
+      key = entry.key;
+    } else {
+      key = keyPool.pick()?.key || null;
+    }
+    if (!key) {
+      return { model, ok: false, category: 'error', latencyMs: null, httpStatus: null, message: '没有可用的 Key', keyId, checkedAt: new Date().toISOString() };
+    }
+    const r = await probeModel({ key, model });
+    return { ...r, keyId: keyId || keyPool.idForKey(key), checkedAt: new Date().toISOString() };
+  },
+});
 
 // ── 工具函数 ───────────────────────────────────────
 
@@ -1167,37 +1291,20 @@ const AUTH_ERR_MSG = {
   upstream_unconfigured: 'Server upstream API key not configured',
 };
 
-// ── 上游 Key 选择（多 Key 随机轮询）──────────────────
-// 随机选取并避让连续重复；连续命中同一 Key 达上限后不再避让，兜底打破死锁
-const MAX_CONSECUTIVE_SAME_KEY = 8;
+// ── 上游 Key 选择（多 Key 轮询）──────────────────────
+// 真正的选择逻辑在 lib/keys.mjs：策略（round_robin / random / fill）、冷却避让、
+// 本轮已失败 Key 的排除、以及「全部冷却中」时的退化策略都在那里。
+// 这里只留一层薄封装，让数据面的调用点保持不变。
 const MAX_KEY_ATTEMPTS = 3;   // 单请求最多尝试的 Key 个数
 
-let lastPickedKey = null;
-let consecutiveSameKey = 0;
-
-// exclude：本轮已失败的 Key，优先避开
+// exclude：本轮已失败的 Key（字符串集合），优先避开
 function pickUpstreamKey(exclude) {
-  const keys = CFG.apiKeyList;
-  if (!keys || keys.length === 0) return null;
-  if (keys.length === 1) return keys[0];
-
-  let pool = exclude && exclude.size ? keys.filter(k => !exclude.has(k)) : keys;
-  if (pool.length === 0) pool = keys;   // 全部试过，回到全集
-
-  // 避让上次使用的 Key；已达连续上限则跳过避让
-  if (pool.length > 1 && consecutiveSameKey < MAX_CONSECUTIVE_SAME_KEY) {
-    const avoided = pool.filter(k => k !== lastPickedKey);
-    if (avoided.length > 0) pool = avoided;
-  }
-
-  const key = pool[Math.floor(Math.random() * pool.length)];
-  consecutiveSameKey = key === lastPickedKey ? consecutiveSameKey + 1 : 1;
-  lastPickedKey = key;
-  return key;
+  const picked = keyPool.pick(exclude);
+  return picked ? picked.key : null;
 }
 
 // 鉴权入口：成功返回 { upstreamKey }，失败返回 { error }
-// - proxyKey 非空 → 严格模式：客户端只认 proxyKey，上游凭证从 apiKey 列表随机选取（不再透传）
+// - proxyKey 非空 → 严格模式：客户端只认 proxyKey，上游凭证从 Key 池按策略选取（不再透传）
 // - proxyKey 为空 → 保护未启用，沿用旧的透传行为
 function authenticate(headers) {
   if (!CFG.proxyKey) {
@@ -1207,8 +1314,9 @@ function authenticate(headers) {
   const cred = extractCredential(headers);
   if (!cred) return { error: 'missing' };
   if (!safeEqual(cred, CFG.proxyKey)) return { error: 'invalid' };
-  if (CFG.apiKeyList.length === 0) return { error: 'upstream_unconfigured' };
-  return { upstreamKey: pickUpstreamKey() };
+  const picked = keyPool.pick();
+  if (!picked) return { error: 'upstream_unconfigured' };
+  return { upstreamKey: picked.key };
 }
 
 // 统一的鉴权失败响应；Anthropic 端点的错误结构不同
@@ -1230,7 +1338,9 @@ function sendAuthError(res, code, anthropicStyle = false) {
 // 因此不需要 undici / https-proxy-agent，engines >=18 也能用。
 // 注意 Node 原生 fetch 不读 HTTPS_PROXY/HTTP_PROXY；官方的环境变量方案需要
 // Node >= 22.21 / 24.5 并设 NODE_USE_ENV_PROXY=1（README 有说明）。
-const UPSTREAM_PROXY = CFG.upstreamProxy || '';
+// 上游代理地址支持后台热改，所以是 let + 显式刷新，而不是模块级 const 快照。
+// 改地址不需要重启：后续请求各自新建隧道，旧 socket 自然回收。
+let UPSTREAM_PROXY = CFG.upstreamProxy || '';
 const PROXY_CONNECT_TIMEOUT_MS = 15000;
 
 // 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
@@ -1365,6 +1475,20 @@ function upstreamFetch(urlStr, options) {
   return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
 }
 
+/**
+ * 后台改了 upstreamProxy 之后重建派生状态。
+ * 启动时写入的是 const 快照，这里换成显式刷新 —— 地址要么走到新隧道、
+ * 要么走直连，不会出现「一半请求还在用旧代理」的中间态。
+ */
+function refreshUpstreamProxy() {
+  const next = CFG.upstreamProxy || '';
+  if (next === UPSTREAM_PROXY) return false;
+  const prev = UPSTREAM_PROXY;
+  UPSTREAM_PROXY = next;
+  log('info', '上游代理配置已更新', { from: redactProxyUrl(prev), to: redactProxyUrl(next) });
+  return true;
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -1447,7 +1571,7 @@ async function drainErrorResponse(response) {
 // 带换 Key 重试的上游调用：始终返回最后一次的响应，错误映射仍由调用方按原逻辑处理
 // 单 Key（或透传模式）下 maxAttempts ≤ 1，等价于不重试，行为与改动前一致
 async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
-  const maxAttempts = Math.min(CFG.apiKeyList.length, MAX_KEY_ATTEMPTS);
+  const maxAttempts = Math.min(Math.max(keyPool.size, 1), MAX_KEY_ATTEMPTS);
   const tried = new Set();
   let key = firstKey;
 
@@ -1456,25 +1580,43 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
     await ensureInitialized(key, signal);
     const response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
 
-    // 成功 / 已试满上限 / 状态码本身不值得重试 → 交给调用方处理
-    if (response.ok || attempt >= maxAttempts || !RETRYABLE_KEY_STATUS.has(response.status)) {
+    if (response.ok) {
+      keyPool.recordRequest(key, { ok: true });
+      return { response };
+    }
+
+    // 状态码本身不值得换 Key，或已达尝试上限 → 记一次失败后交调用方处理
+    if (attempt >= maxAttempts || !RETRYABLE_KEY_STATUS.has(response.status)) {
+      keyPool.recordRequest(key, { ok: false });
+      keyPool.recordFailure(key, {
+        category: classifyProbe({ ok: false, httpStatus: response.status }),
+        message: `HTTP ${response.status}`,
+      });
       return { response };
     }
 
     // 状态码看似可重试，还要排除「换 Key 也无济于事」的业务错误
     const { text, response: restored } = await drainErrorResponse(response);
+    const category = classifyProbe({ ok: false, httpStatus: response.status, bodyText: text });
+
+    keyPool.recordRequest(key, { ok: false });
+
     if (isKeyIndependentError(text)) {
+      // 模型不在套餐内：这是模型维度的结论，换 Key 没用，也不能把 Key 罚下场
       log('warn', 'Upstream error is key-independent, not switching key', {
-        status: response.status, attempt, triedCount: tried.size,
+        status: response.status, attempt, triedCount: tried.size, category,
       });
       return { response: restored };
     }
+
+    // 真正与 Key 相关（额度/鉴权/网络）才进冷却，供后续请求避开
+    keyPool.recordFailure(key, { category, message: summarizeUpstreamError(text, 200) });
 
     const nextKey = pickUpstreamKey(tried);
     if (!nextKey || tried.has(nextKey)) return { response: restored };   // 已无其他可用 Key
 
     log('warn', 'Upstream key failed, switching key', {
-      status: response.status, attempt, triedCount: tried.size,
+      status: response.status, attempt, triedCount: tried.size, category,
     });
     key = nextKey;
   }
@@ -2781,47 +2923,13 @@ async function handleMessages(req, res) {
 }
 
 // ── 动态模型列表 ────────────────────────────────────
-
-let dynamicModels = null;
-let modelsLastFetch = 0;
+// 拉取/缓存/单飞/静态回退都交给 lib/models.mjs（catalog），这里只做形状适配：
+// 旧的 fetchModels 只取 id/name，丢掉了上游给的 context_length 与 supported_endpoints，
+// 那两项在后台「模型」页要用。
 
 async function fetchModels(apiKey) {
-  const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
-  }
-
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
-
-    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
-      }
-    }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
-  } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
-  }
-
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  const models = await catalog.sync({ apiKey });
+  return models.map(m => ({ id: m.id, name: m.name }));
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
@@ -3566,7 +3674,9 @@ async function handleModels(req, res) {
     sendAuthError(res, auth.error);
     return;
   }
-  const models = await fetchModels(auth.upstreamKey ?? null);
+  // 拉目录需要一个上游 Key：优先用本次鉴权得到的，否则从池里取一个
+  const keyForCatalog = auth.upstreamKey || keyPool.pick()?.key || null;
+  const models = await fetchModels(keyForCatalog);
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -3584,10 +3694,27 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+// ── 后台 API 装配 ────────────────────────────────────
+// 依赖在这里显式注入，lib/ 之间因此没有循环 import —— 装配点只有这一处。
+const adminApi = createAdminApi({
+  auth: adminAuth,
+  pool: keyPool,
+  catalog,
+  runner: modelTestRunner,
+  logBus,
+  log: (...args) => log(...args),
+  probe: probeModel,
+  startedAt: SERVER_STARTED_AT,
+  reloadUpstreamProxy: refreshUpstreamProxy,
+  getInflight: () => inflightCount,
+  get address() { return `http://${CFG.host}:${CFG.port}`; },
+});
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  // CORS
+  // CORS（仅数据面）。后台接口在 adminApi 内部显式摘掉这些头：
+  // 后台用 Cookie 鉴权，带 ACAO:* 只会白白扩大可被跨站页面驱动的面。
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -3599,6 +3726,23 @@ const server = http.createServer(async (req, res) => {
 
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
+
+  // 后台请求先分流：它既不该占用数据面的在途配额，也不该受 MAX_INFLIGHT 影响。
+  // SSE 日志流是长连接，若按数据面计数会永久占住一个槽位。
+  if (adminApi.isAdminPath(url.pathname)) {
+    try {
+      if (adminApi.isApiPath(url.pathname)) {
+        await adminApi.handle(req, res, url);
+      } else {
+        // /admin、/admin/、/admin/login 与前端静态资源
+        adminApi.serveAsset(req, res, url.pathname);
+      }
+    } catch (e) {
+      log('error', '后台请求处理异常', { path: url.pathname, error: e.message });
+      if (!res.headersSent) sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
+    }
+    return;
+  }
 
   // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
   const isLiveness = url.pathname === '/health' || url.pathname === '/';
@@ -3675,19 +3819,24 @@ server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
 server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
 
 server.listen(CFG.port, CFG.host, () => {
+  const keyState = keyPool.countByState();
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
+    admin: `http://${CFG.host}:${CFG.port}/admin/`,
     api: CFG.apiBase,
-    models: MODELS.length,
+    keys: `${keyState.total} 个（启用 ${keyState.enabled}）`,
+    strategy: CFG.strategy,
     session: '12h + 1h jitter, per API key',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
+    logLevel: CFG.logLevel,
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
-    maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
+    maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health 与 /admin/* 豁免)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    dataDir: DATA_DIR,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
@@ -3702,17 +3851,52 @@ server.listen(CFG.port, CFG.host, () => {
       hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
+
   if (CFG.proxyKey) {
-    if (CFG.apiKeyList.length > 0) {
-      log('info', 'Access protection enabled. Clients authenticate with proxyKey; upstream keys are picked randomly.', {
-        upstreamKeys: CFG.apiKeyList.length,
-        maxConsecutiveSameKey: MAX_CONSECUTIVE_SAME_KEY,
-        maxAttemptsPerRequest: Math.min(CFG.apiKeyList.length, MAX_KEY_ATTEMPTS),
+    if (keyState.enabled > 0) {
+      log('info', '访问保护已启用：客户端用 proxyKey 鉴权，上游 Key 按策略轮询', {
+        upstreamKeys: keyState.enabled,
+        strategy: CFG.strategy,
+        maxAttemptsPerRequest: Math.min(Math.max(keyState.enabled, 1), MAX_KEY_ATTEMPTS),
       });
     } else {
-      log('warn', 'proxyKey is set but apiKey is empty. All API requests will fail with 500 until at least one upstream user_ key is configured.');
+      log('warn', 'proxyKey is set but no upstream key configured. All API requests will fail with 500 until at least one user_ key is added (后台 /admin/ 或 config.json / CC_API_KEY).');
     }
-  } else if (CFG.apiKeyList.length === 0) {
+  } else if (keyState.enabled === 0) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
+
+  // 后台可用性提示：未设密码时后台整体拒绝访问（不是「无密码可进」）
+  if (!adminAuth.isConfigured()) {
+    log('warn', '后台未设置管理密码，/admin/ 拒绝访问。请设置 ADMIN_PASSWORD 环境变量，或在后台首次初始化后于 data/.admin-auth.json 中保存密码。');
+  } else {
+    log('info', '后台管理面板可用', { url: `http://${CFG.host}:${CFG.port}/admin/`, passwordSource: adminAuth.source() });
+  }
+
+  // 启动即预热模型目录：后台「模型」页打开时就有数据，不必等用户点刷新
+  const warmKey = keyPool.pick()?.key || null;
+  if (warmKey) {
+    catalog.sync({ apiKey: warmKey }).catch(() => {});
+  }
+
+  // 手工编辑 config.json 也能热生效（轮询 mtime，不依赖 fs.watch 的跨平台可靠性）
+  startConfigWatcher({
+    onReload: (cfg) => {
+      refreshUpstreamProxy();
+      log('info', 'config.json 已变更并热加载', {
+        strategy: cfg.strategy, logLevel: cfg.logLevel, upstreamProxy: redactProxyUrl(cfg.upstreamProxy || ''),
+      });
+    },
+    onError: (e) => log('warn', 'config.json 热加载失败', { error: e.message }),
+  });
 });
+
+// ── 退出前把防抖中的用量计数落盘 ──────────────────────
+// 用量是每 5 秒才落一次盘，进程被 SIGTERM 时最后一次改动还在内存里。
+function flushAndExit(signal) {
+  log('info', `收到 ${signal}，正在落盘 Key 池用量后退出`);
+  try { keyPool.flushSync(); } catch {}
+  process.exit(0);
+}
+process.on('SIGTERM', () => flushAndExit('SIGTERM'));
+process.on('SIGINT', () => flushAndExit('SIGINT'));

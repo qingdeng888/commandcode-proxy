@@ -1,8 +1,13 @@
 node_modules/
+**/node_modules/
 .git/
 *.log
+# 前端构建产物在镜像内重新构建，不必进上下文（也避免用到本地的过期产物）
+web/dist/
 # 本地配置（含 proxyKey / apiKey），绝不能进镜像
 config.json
+# 数据目录含上游 Key 明文与后台密码哈希，绝不能烘进镜像
+data/
 .commandcode/
 .opencode/
 .omo/

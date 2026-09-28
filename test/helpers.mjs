@@ -3,7 +3,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { mkdtempSync, copyFileSync, existsSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, copyFileSync, existsSync, rmSync, readFileSync, writeFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,6 +100,10 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   const ownWorkdir = cwd === undefined;
   const workdir = cwd ?? mkdtempSync(join(tmpdir(), 'ccp-test-'));
   copyFileSync(join(REPO, 'proxy.mjs'), join(workdir, 'proxy.mjs'));
+  // 代理已拆分为多个模块：lib/ 必须一起拷进去，否则被测进程 import 失败。
+  // 拷到临时目录这个设计本身是有价值的 —— ROOT 因此指向临时目录，
+  // config.json 与 data/（Key 池、后台密码）都落在沙箱里，不会污染真实部署。
+  cpSync(join(REPO, 'lib'), join(workdir, 'lib'), { recursive: true });
   if (!existsSync(join(workdir, 'config.json'))) {
     // 本 fork 把配置模板改名为 config.json.example，且 config.json 不入版本控制
     // （避免 proxyKey / apiKey 被提交），故优先用 config.json，缺失时回退到模板。

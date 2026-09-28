@@ -33,21 +33,35 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ```
 commandcode/
+├── proxy.mjs             # 入口 + 数据面（转发管线，已针对流式/超时/背压调优）
+├── lib/                  # 服务端模块（零运行时依赖）
+│   ├── config.mjs        # 配置加载 / 热加载 / 原子写回
+│   ├── store.mjs         # 原子持久化（临时文件 + rename）
+│   ├── keys.mjs          # Key 池：轮询策略、冷却、用量、健康
+│   ├── models.mjs        # 模型目录（上游拉取 + 缓存 + 静态回退）+ 测试任务
+│   ├── admin-auth.mjs    # 后台密码（scrypt）、会话、登录限速
+│   ├── admin-api.mjs     # 后台 REST API + SSE 实时日志
+│   ├── admin-ui.mjs      # 后台静态资源托管
+│   └── logbus.mjs        # 日志环形缓冲 + 订阅
+├── web/                  # 后台前端（Vite + Vue 3）
+│   ├── src/              # 源码
+│   └── dist/             # 构建产物（由 npm run build:web 或 Docker 构建生成，不入库）
+├── data/                 # 运行时数据（**不入库**）：Key 池、后台密码、模型测试结论
+├── docs/
+│   └── admin-api.md      # 后台 API 契约（前后端唯一接口）
+├── test/                 # 测试（node:test，无需测试框架依赖）
 ├── config.json.example   # 配置模板（复制为 config.json 后修改）
-├── LICENSE               # MIT License
-├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
-├── Dockerfile            # 容器构建文件（node:22-alpine）
+├── Dockerfile            # 两阶段构建：先构建前端，再产出运行镜像
 ├── docker-compose.yml    # 容器编排（默认使用 GHCR 预构建镜像）
 ├── docker-compose.local.yml   # 本地源码构建编排
-├── .dockerignore         # 构建上下文排除规则
-├── .github/
-│   └── workflows/
-│       └── docker-publish.yml  # release 分支 / v* tag → GHCR 多架构（latest + release）
-├── captured-requests/    # CLI 抓包数据（协议逆向参考）
+├── .github/workflows/docker-publish.yml  # master/main/release 或 v* tag → GHCR 多架构
+├── LICENSE               # MIT License
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
 ```
+
+> `data/` 目录含**上游 Key 明文**（`keys.json`）与**后台密码哈希**（`.admin-auth.json`），
+> 已被 `.gitignore` 与 `.dockerignore` 双重排除，绝不会进版本库或镜像。
 
 ## 配置
 
@@ -61,10 +75,12 @@ commandcode/
 | `host` | `0.0.0.0` | 监听地址 |
 | `apiBase` | `https://api.commandcode.ai` | CC API 地址 |
 | `projectSlug` | `cc-proxy` | `x-project-slug` header |
-| `proxyKey` | `""` | 本地访问口令。**非空即启用严格鉴权**：客户端只认它，上游凭证从 `apiKey` 列表随机选取（详见「访问保护」） |
-| `apiKey` | `""` | 上游 CC API Key（`user_` 开头），**支持单个字符串或字符串数组**（多 Key 随机轮询）。`proxyKey` 为空时忽略 |
+| `proxyKey` | `""` | 数据面访问口令。**非空即启用严格鉴权**：客户端只认它，上游凭证从 Key 池按策略选取（详见「访问保护」） |
+| `apiKey` | `""` | 上游 CC API Key（`user_` 开头），**支持单个字符串或字符串数组**。历史字段：新部署建议改用后台 `/admin/` 管理（写入 `data/keys.json`）；此处配置的 Key 会以**只读**条目出现在后台 |
+| `strategy` | `round_robin` | Key 轮询策略：`round_robin`（轮询）/ `random`（随机，避让连续重复）/ `fill`（压满第一个可用） |
+| `defaultModel` | `""` | 默认模型（Key 测试与模型测试用它）；空则取目录首项 |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
-| `logLevel` | `info` | 日志级别 |
+| `logLevel` | `info` | 日志级别：`debug` / `info` / `warn` / `error`（**真实生效**，后台日志页也按此过滤）|
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
@@ -80,8 +96,12 @@ commandcode/
 |------|------|------|
 | `PORT` | `3000`（自带 config.json 为 `3050`）| 监听端口 → `port` |
 | `HOST` | `0.0.0.0` | 监听地址 → `host` |
-| `PROXY_KEY` | 空 | 本地访问口令 → `proxyKey`；**非空即启用严格鉴权**，见[访问保护](#访问保护) |
-| `CC_API_KEY` | 空 | 上游 CC API Key → `apiKey`，**多个用英文逗号分隔**（随机轮询）|
+| `PROXY_KEY` | 空 | 数据面访问口令 → `proxyKey`；**非空即启用严格鉴权**，见[访问保护](#访问保护) |
+| `CC_API_KEY` | 空 | 上游 CC API Key → `apiKey`，**多个用英文逗号分隔**（以只读条目进入 Key 池）|
+| `ADMIN_PASSWORD` | 空 | **管理后台**访问密码（与 `proxyKey` 是两套独立凭证）。**未设置时 `/admin/` 整体拒绝访问**，见 [Web 管理后台](#web-管理后台) |
+| `CC_DATA_DIR` | `<项目>/data` | 运行时数据目录（Key 池 / 后台密码 / 模型测试结论）。Docker 部署务必挂卷 |
+| `CC_LOG_LEVEL` | `info` | 日志级别 → `logLevel` |
+| `ADMIN_COOKIE_SECURE` | 空 | `1` 时给后台会话 Cookie 加 `Secure`（仅在 HTTPS 下开启，否则浏览器不回传 Cookie）|
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
 | `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
@@ -193,6 +213,127 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 - 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
+
+## Web 管理后台
+
+浏览器打开 `http://<主机>:<端口>/admin/` 即可管理 Key、模型与设置，**改动立即生效，无需重启**。
+
+### 访问密码
+
+后台默认**拒绝访问**，必须先设置密码：
+
+```bash
+ADMIN_PASSWORD=你的管理密码 npm start
+# Docker：在 compose 同目录的 .env 中写 ADMIN_PASSWORD=...，compose 会自动读取
+```
+
+- 后台密码与数据面的 `proxyKey` 是**两套独立凭证**：前者给打开面板的人，后者给调用 `/v1/*` 的客户端。混用会让「面板登录」与「API 调用」互相牵制。
+- 登录后可在「设置」页改密码：写入 `data/.admin-auth.json`（scrypt 哈希，权限 600），**优先级高于环境变量**，并立即踢掉其它已登录会话。
+- 登录失败限速：同一来源 15 分钟内失败 5 次锁定 15 分钟（参考实现没有这一层，而后台常被暴露在 `0.0.0.0` 上）。
+- 会话 Cookie：`admin_session`、`HttpOnly`、`SameSite=Lax`、24 小时不滑动续期，重启后需重新登录。
+
+> ⚠️ 后台**没有 HTTPS**。公网部署务必套一层反向代理并启用 TLS，否则密码是明文传输的。
+
+### 功能
+
+| 页面 | 内容 |
+|------|------|
+| 📊 仪表盘 | Key / 模型 / 请求 / Token 统计，上游连通性测试 |
+| 🔑 Key 管理 | 增删改查、启停、👁 揭示明文、⚡ 真实探测、从 `config`/`env` 导入、切换轮询策略 |
+| 🧠 模型 | 上游模型目录（含上下文长度与支持的端点）、单模型测试、批量测试（受限并发 + 可取消）|
+| 📈 用量 | 按 Key 的请求数 / 失败数 / Token（今日与累计），可重置 |
+| 📜 请求日志 | **SSE 实时推送**（非轮询），可暂停、清屏、按级别过滤 |
+| ⚙️ 设置 | 运行配置热更新、修改后台密码 |
+
+### Key 的三种来源
+
+| 来源 | 存储 | 可否编辑 |
+|------|------|----------|
+| `ui` | `data/keys.json` | ✅ 后台随意增删改 |
+| `config` | `config.json` 的 `apiKey` | ❌ 只读，可在后台「导入」为 `ui` |
+| `env` | `CC_API_KEY` 环境变量 | ❌ 只读，同上 |
+
+三者合并成**同一个轮询池**。同一串 Key 不会在两种来源里重复出现（`ui` 优先）。
+
+**轮询策略**（后台可切换，或设置 `strategy`）：
+
+- `round_robin`：按顺序依次使用（默认）
+- `random`：随机挑选，并**避让连续重复**（纯随机会把一个号打穿；连续 8 次后不再避让以打破死锁）
+- `fill`：优先压满第一个可用 Key，再切下一个
+
+**失败切换与冷却**：上游返回 `401/402/403/429/5xx` 时自动换 Key 重试，单请求最多 `min(Key 数, 3)` 个。
+被判定为 Key 相关失败的会进入冷却，后续请求自动避开：
+
+| 失败性质 | 冷却时长 |
+|---|---|
+| 额度用尽（`USAGE_EXCEEDED`）| 10 分钟 |
+| Key 失效（`UNAUTHORIZED`）| 30 分钟 |
+| 网络异常 / 超时 | 5 分钟 |
+| 其它上游错误 | 不冷却，只计数 |
+| **模型不在套餐内**（`MODEL_NOT_IN_PLAN`）| **不冷却** —— 这是模型维度的结论，不该把 Key 罚下场 |
+
+> 冷却是**我们自己的启发式**，不是上游的权威判定。因此当所有 Key 都在冷却时，代理不会拒绝服务，
+> 而是退化为「按冷却结束时间最早」优先选择 —— 因为启发式而拒绝服务等于自造故障。
+
+### 模型目录与模型测试
+
+模型列表来自 Command Code 上游 `GET /provider/v1/models`（默认 5 分钟缓存），
+并保留上游给出的 `context_length` 与 `supported_endpoints`。
+上游不可达时回退到内置静态列表，此时后台会明确显示为 `static` 来源（`fromUpstream: false`），
+不会假装已同步。
+
+**模型测试**用指定 Key 对指定模型发一次真实最小请求，按上游错误码归类：
+
+| 分类 | 判据 | 含义 |
+|---|---|---|
+| `ok` | 正常返回 | 链路通 |
+| `unauthorized` | `UNAUTHORIZED` | Key 无效 |
+| `quota` | `USAGE_EXCEEDED` | 额度用尽 |
+| `not_in_plan` | `MODEL_NOT_IN_PLAN` | **Key 有效，但该模型不在套餐内** |
+| `network` | 连接失败 / 超时 | 网络问题 |
+| `error` | 其它 | 上游错误 |
+
+> 参考项目 Cline-proxy 的「付费模型验证」用的是**余额差值探测**（跑一次模型前后各查一次账户余额，
+> 掉余额即收费模型）。这套机制在 Command Code 上**无法照搬**：实测 `/provider/v1/usage`、
+> `/provider/v1/balance`、`/api/v1/users/me` 全部 404，CC 不暴露任何余额/用量接口。
+> 因此改为上面的就地判定 —— 能不能跑通、因为什么跑不通，由上游错误码直接回答。
+
+### 热加载
+
+后台的所有改动都作用于**运行中的进程**，无需重启：
+
+| 改动 | 生效方式 |
+|------|----------|
+| 增删改 Key、启停 | 下一个请求立即生效（`keys.json` 立即落盘）|
+| 轮询策略 / 默认模型 / ZDR / 日志级别 | 立即生效 |
+| 上游 HTTP 代理 | 立即重建隧道（后续请求走新地址）|
+| `proxyKey` | 立即生效 |
+| 端口 / 监听地址 | **需重启**（后台会提示）|
+
+手工编辑 `config.json` 也会热加载（每 3 秒轮询 mtime，不依赖 `fs.watch` 的跨平台可靠性）。
+注意**环境变量优先级最高**：若某字段由环境变量锁定，后台修改不会生效，接口会明确告知。
+
+### 数据文件
+
+| 文件 | 内容 | 权限 |
+|------|------|------|
+| `data/keys.json` | 后台添加的上游 Key（**明文**）| 600 |
+| `data/.admin-auth.json` | 后台密码的 scrypt 哈希 | 600 |
+| `data/model-tests.json` | 最近一次批量模型测试结果 | 600 |
+
+用 `CC_DATA_DIR` 可改目录。**Docker 部署必须把这个目录挂出来**，否则容器重建后后台配置全部丢失。
+
+### 本地开发前端
+
+前端是 Vite + Vue 3，源码在 `web/`：
+
+```bash
+npm run build:web     # 构建到 web/dist（后端直接托管）
+npm run dev:web       # 带热更新的开发服务器
+```
+
+未构建时访问 `/admin/` 会得到一页明确的「前端尚未构建」提示（数据面接口不受影响）。
+Docker 构建会自动完成前端构建，无需手工执行。
 
 ## API 接口
 
@@ -630,6 +771,33 @@ cp config.json.example config.json
 >
 > ⚠️ **容器内端口恒为 `3050`**：`Dockerfile` 与 `docker-compose.yml` 都设置了 `PORT=3050` 环境变量，而环境变量的优先级**高于** `config.json` 的 `port` 字段。因此挂载配置文件里的 `port` 字段不会改变容器内监听端口 —— 对外端口由 `PROXY_PORT`（主机侧映射）决定。
 
+### 数据目录挂载（后台配置持久化）
+
+后台添加的 Key、后台密码、模型测试结论都写在 `/app/data`。**不挂卷的话，容器重建后这些全部丢失**：
+
+```yaml
+volumes:
+  - ./data:/app/data
+```
+
+`docker-compose.yml` 已默认挂载（目录不存在时 Docker 会自动创建，与 `config.json` 那种「文件被创建成目录」的坑不同）。
+镜像内该目录已声明为 `VOLUME`，用裸 `docker run` 时需要显式 `-v "$PWD/data:/app/data"`。
+
+> 💡 只想用配置文件管 Key 也可以：把 Key 写进 `config.json` 的 `apiKey` 或 `CC_API_KEY` 环境变量，
+> 它们会以**只读**条目出现在后台，不依赖 `data/` 卷。后台的增删改才会写 `data/`。
+
+### 管理后台密码（Docker）
+
+```bash
+# 方式一：compose 同目录放 .env（compose 会自动读取并注入）
+echo 'ADMIN_PASSWORD=你的管理密码' > .env
+
+# 方式二：直接传环境变量
+ADMIN_PASSWORD=你的管理密码 docker compose up -d
+```
+
+未设置时后台整体拒绝访问（不是「无密码可进」），启动日志会给出明确警告。
+
 ### 从源码构建（本地开发）
 
 需要基于当前源码构建时，改用 `docker-compose.local.yml` —— 它与默认编排的唯一区别是把 `image:` 换成 `build: .`，端口映射、配置挂载、健康检查保持一致：
@@ -657,12 +825,14 @@ npm run docker:build:multi
 
 ### 环境变量
 
-容器相关的只有两个，其余全部见上面的[环境变量](#环境变量)总表：
+容器相关的只有这几个，其余全部见上面的[环境变量](#环境变量)总表：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `3050` | 容器内监听端口（优先级高于 `config.json` 的 `port`） |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
+| `ADMIN_PASSWORD` | 空 | 管理后台密码；未设置时 `/admin/` 拒绝访问 |
+| `CC_DATA_DIR` | `/app/data` | 运行时数据目录（镜像内已设，配合卷挂载） |
 
 ## 在途请求上限（可选）
 

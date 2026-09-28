@@ -7,8 +7,10 @@
   "main": "proxy.mjs",
   "scripts": {
     "start": "node proxy.mjs",
-    "dev": "node --watch --watch-path=./proxy.mjs --watch-path=./config.json proxy.mjs",
+    "dev": "node --watch --watch-path=./proxy.mjs --watch-path=./config.json --watch-path=./lib proxy.mjs",
     "test": "node --test test/*.test.mjs",
+    "build:web": "npm --prefix web install --no-audit --no-fund && npm --prefix web run build",
+    "dev:web": "npm --prefix web run dev",
     "docker:build": "docker build -t commandcode-proxy:latest .",
     "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest ."
   },
