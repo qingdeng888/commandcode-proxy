@@ -228,10 +228,19 @@ Key 列表项（下称 `KeyItem`）：
   "zdr": false, "logLevel": "info", "logFile": "",
   "useProviderModels": true, "modelRefreshIntervalMs": 300000,
   "upstreamProxy": "", "strategy": "round_robin", "defaultModel": "deepseek/deepseek-v4-flash",
-  "dataDir": "/app/data", "version": "1.1.0",
-  "configPath": "/app/config.json"
+  "dataDir": "/app/data", "configPath": "/app/config.json",
+  "settingsPath": "/app/data/settings.json",
+  "version": "1.1.0",
+  "envLocked": ["logLevel"],
+  "settingSources": { "strategy": "settings", "logLevel": "env", "port": "config" }
 } }
 ```
+
+- `settingSources`：每个字段的值当前取自哪一层 —— `default` | `config`（`config.json`）|
+  `settings`（后台写入的 `data/settings.json`）| `env`（环境变量）。后台可据此标注来源。
+- `envLocked`：被环境变量锁定的字段。这些字段**后台改不动**（不落盘也不改内存），
+  提交时会在 `message` 中明确列出。
+- `settingsPath`：后台改动的落盘位置。
 
 ### `POST /admin/api/config/update` （保护）
 请求（全部字段可选，只更新传入的）：
@@ -245,12 +254,21 @@ Key 列表项（下称 `KeyItem`）：
   "projectSlug": "cc-proxy",
   "proxyKey": "新口令" }
 ```
-- 200 `{ "success": true, "data": { ...更新后的同 GET 结构... } }`
+- 200 `{ "success": true, "data": { ...更新后的同 GET 结构... }, "message": "..." }`
 - 400：`strategy` 非法 → `策略非法，必须是 round_robin / random / fill`；
   `defaultModel` 不在目录中 → `未知模型: <id>`；
   `upstreamProxy` 非法 → `上游代理地址无效（仅支持 http://host:port）`。
-- 写入 `config.json`（原子替换）。`port` / `host` 改动需重启，接口会返回
-  `message: "端口/监听地址改动需重启进程后生效"`。
+
+**落盘位置**：改动写入 `data/settings.json`，**不修改 `config.json`**。
+`config.json` 是部署期输入（Docker 里通常以只读单文件挂载），保持原样。
+
+**配置分层优先级**：`环境变量` > `data/settings.json`（后台写入）> `config.json` > 内置默认值。
+只写被改动的字段（稀疏覆盖），因此后台没碰过的字段仍然听 `config.json` 的。
+
+`message` 会说明落盘结果与需要注意的情况，例如：
+`已保存到 data/settings.json；以下字段在 config.json 中也有配置，后台设置（data/settings.json）优先：strategy`、
+`以下字段由环境变量锁定，后台修改不会生效：logLevel`、
+`端口/监听地址改动需重启进程后生效`。
 
 ## 日志
 

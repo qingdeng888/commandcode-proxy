@@ -13,9 +13,20 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 ## Quick Start
 
 ```bash
-npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
-npm run dev      # Watch mode (auto-reload on file changes)
+cp config.json.example config.json      # First run: copy the template
+ADMIN_PASSWORD=your-admin-password npm start   # Listens on http://0.0.0.0:3050
+# Then open http://127.0.0.1:3050/admin/ and add your Command Code keys in the browser
 ```
+
+> The template ships `proxyKey` and `apiKey` **empty** (feature off) and contains no placeholder
+> credentials — copying it will not silently enable strict auth or leave a publicly known password
+> in place. There are three ways to supply keys, pick any:
+> 1. **Admin panel** (recommended): add them at `/admin/`, stored in `data/keys.json`, effective immediately;
+> 2. `config.json` → `apiKey` (string or array);
+> 3. the `CC_API_KEY` environment variable (comma-separated).
+>
+> Options 2 and 3 appear as **read-only** entries in the panel, where you can "import" them into
+> panel-managed entries with one click.
 
 API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
 
@@ -25,6 +36,9 @@ curl http://127.0.0.1:3050/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+> Bound to `0.0.0.0`, this means **anyone who can reach it may use the proxy** (with their own key).
+> To require a password instead, set `proxyKey` — see [Access protection](#access-protection).
 
 ## File Structure
 
@@ -83,6 +97,10 @@ commandcode/
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
 | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+
+> 📌 `config.json` is **deployment-time input**. The panel (`/admin/`) writes to
+> `data/settings.json` and never rewrites this file — which is why it is safe to mount read-only
+> under Docker. See [Web Admin Panel](#web-admin-panel) for the precedence rules.
 
 ### Environment Variables
 
@@ -168,8 +186,9 @@ ADMIN_PASSWORD=your-admin-password npm start
 - Session cookie: `admin_session`, `HttpOnly`, `SameSite=Lax`, fixed 24h TTL, in-memory
   (a restart requires logging in again).
 
-> ⚠️ The panel has **no HTTPS of its own**. Behind a public network, front it with a reverse proxy
-> and TLS — otherwise the password travels in cleartext.
+> The panel does not provide TLS itself, same as the reference project — nothing extra is needed
+> for LAN use. Only if you expose it to the public internet, put a reverse proxy with HTTPS in
+> front of it (the password is submitted in cleartext).
 
 ### Features
 
@@ -233,20 +252,34 @@ is not in your plan) / `network` / `error`.
 | Change | How it takes effect |
 |--------|--------------------|
 | Add/edit/delete/enable keys | Next request (`keys.json` is written immediately) |
-| Rotation strategy / default model / ZDR / log level | Immediately |
+| Rotation strategy / default model / ZDR / log level | Immediately, written to `data/settings.json` |
 | Upstream HTTP proxy | Tunnels rebuilt immediately |
 | `proxyKey` | Immediately |
 | Port / listen address | **Restart required** (the panel says so) |
 
-Hand-editing `config.json` also hot-reloads (mtime polled every 3 s — more portable than `fs.watch`).
-**Environment variables win over everything**: if a field is pinned by one, panel edits are refused
-with an explicit message.
+Settings are written to **`data/settings.json`**, *not* `config.json`. The reason: under Docker
+`config.json` is a **single-file bind mount** (and `:ro`), while atomic writes use
+"temp file + rename" — and `rename()` onto a single-file mount point fails with `EBUSY`. The change
+would land in memory only, the host file would stay untouched, and it would vanish on container
+recreation. `data/` is a directory mount where rename works, so all mutable state lives there
+(the reference project uses the same architecture). `config.json` can therefore stay read-only,
+which matters because it also holds secrets like `proxyKey`.
+
+**Precedence:** `environment` > `data/settings.json` (panel writes) > `config.json` > built-in
+defaults. The panel writes only the **fields it changed** (a sparse overlay), so fields it never
+touched still follow `config.json`. `GET /admin/api/config` reports each field's origin
+(`settingSources`), and a save that conflicts with `config.json` says so explicitly.
+
+Hand-editing `config.json` also hot-reloads (mtime polled every 3 s — more portable than
+`fs.watch`). Fields pinned by an environment variable cannot be changed from the panel at all
+(neither persisted nor applied in memory), and the response lists exactly which ones.
 
 ### Data files
 
 | File | Contents | Mode |
 |------|----------|------|
 | `data/keys.json` | Panel-managed upstream keys (**plaintext**) | 600 |
+| `data/settings.json` | Settings changed from the panel (sparse overlay) | 600 |
 | `data/.admin-auth.json` | scrypt hash of the admin password | 600 |
 | `data/model-tests.json` | Results of the last batch test | 600 |
 

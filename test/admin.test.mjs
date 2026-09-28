@@ -4,8 +4,11 @@
 // 只能靠真实起进程 + 真实 HTTP 调用来验证。全部走 mock 上游，不需要真 Key。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { setup, startProxy, allocPort, closeServer } from './helpers.mjs';
+import { setup, startProxy, allocPort, closeServer, seedConfig } from './helpers.mjs';
 import http from 'node:http';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const PASSWORD = 'test-password-123';
 const BASE_ENV = { ADMIN_PASSWORD: PASSWORD, CC_API_KEY: '' };
@@ -488,7 +491,158 @@ test('设置接口可热改策略与默认模型，非法值被拒', async () =>
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
-// ── ⑪ 日志 ───────────────────────────────────────────
+// ── ⑪ 配置持久化（Docker 单文件挂载下最容易坏的一环）──────────
+//
+// 背景：Docker 里 config.json 是**单文件 bind mount**，而原子写是「临时文件 + rename」。
+// 单文件挂载点上 rename 会直接 EBUSY，改动只进内存、宿主文件纹丝不动，容器重建即丢失。
+// 因此后台的修改写进 data/settings.json（目录挂载，rename 正常）。
+
+test('设置改动写入 data/settings.json（而不是 config.json），且重启后仍在', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-persist-'));
+  seedConfig(workdir);
+  const cfgBefore = readFileSync(join(workdir, 'config.json'), 'utf-8');
+  const upstream = await startCatalogUpstream();
+  const env = { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' };
+
+  const proxy1 = await startProxy({ upstreamPort: upstream.port, env, cwd: workdir });
+  try {
+    const api = await authed(proxy1);
+    await api.get('/models');
+    const r = await api.post('/config/update', { strategy: 'random', projectSlug: 'from-panel' });
+    assert.equal(r.status, 200);
+    assert.match((await r.json()).message || '', /settings\.json/, '响应应说明落在了哪里');
+  } finally { await proxy1.kill(); }
+
+  // 落在 data/settings.json，且只写了改动的字段
+  const settingsPath = join(workdir, 'data', 'settings.json');
+  assert.ok(existsSync(settingsPath), '应生成 data/settings.json');
+  const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+  assert.equal(settings.strategy, 'random');
+  assert.equal(settings.projectSlug, 'from-panel');
+  assert.equal(settings.apiBase, undefined, '只写被改动的字段，不该整份复制');
+
+  // config.json 必须原封不动（它是部署期输入，不该被后台改写）
+  assert.equal(readFileSync(join(workdir, 'config.json'), 'utf-8'), cfgBefore,
+    'config.json 不应被后台修改');
+
+  // 重启（同一工作目录）后设置仍在
+  const proxy2 = await startProxy({ upstreamPort: upstream.port, env, cwd: workdir });
+  try {
+    const api = await authed(proxy2);
+    const cfg = (await (await api.get('/config')).json()).data;
+    assert.equal(cfg.strategy, 'random', '重启后设置必须还在');
+    assert.equal(cfg.projectSlug, 'from-panel');
+    assert.equal(cfg.settingSources.strategy, 'settings', '应标明该值来自后台设置');
+    assert.match(cfg.settingsPath, /settings\.json$/);
+  } finally {
+    await proxy2.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('配置分层优先级：环境变量 > data/settings.json > config.json', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-layer-'));
+  const upstream = await startCatalogUpstream();
+  // config.json 层：预置 logLevel 与 projectSlug，作为最底层输入
+  seedConfig(workdir, { logLevel: 'warn', projectSlug: 'from-config' });
+
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+    cwd: workdir,
+  });
+  try {
+    const api = await authed(proxy);
+    const c0 = (await (await api.get('/config')).json()).data;
+    assert.equal(c0.logLevel, 'warn', 'config.json 的值应生效');
+    assert.equal(c0.settingSources.logLevel, 'config');
+
+    // 后台改 logLevel → settings 层应压过 config 层
+    await api.post('/config/update', { logLevel: 'info' });
+    const c1 = (await (await api.get('/config')).json()).data;
+    assert.equal(c1.logLevel, 'info');
+    assert.equal(c1.settingSources.logLevel, 'settings', '后台设置应压过 config.json');
+
+    // 未被子层覆盖的字段仍听 config.json
+    assert.equal(c1.projectSlug, 'from-config', '后台没碰过的字段仍来自 config.json');
+  } finally { await proxy.kill(); }
+
+  // 环境变量层最高：即便 settings.json 里写了，也被环境变量压住并明确告知
+  const proxy2 = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true', CC_LOG_LEVEL: 'error' },
+    cwd: workdir,
+  });
+  try {
+    const api = await authed(proxy2);
+    const c2 = (await (await api.get('/config')).json()).data;
+    assert.equal(c2.logLevel, 'error', '环境变量必须压过 settings.json');
+    assert.equal(c2.settingSources.logLevel, 'env');
+    assert.ok(c2.envLocked.includes('logLevel'), '应把 logLevel 标为环境变量锁定');
+
+    const r = await api.post('/config/update', { logLevel: 'debug' });
+    const body = await r.json();
+    assert.match(body.message || '', /环境变量锁定/, '后台改被锁字段时必须明确提示');
+    assert.equal(body.data.logLevel, 'error', '被锁字段的值不应被改掉');
+  } finally {
+    await proxy2.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('设置提交整份表单时只落盘真正变化的字段（避免 settings.json 变成整份快照）', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-diff-'));
+  seedConfig(workdir);
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+    cwd: workdir,
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');
+    const cfg = (await (await api.get('/config')).json()).data;
+
+    // 1) 原样回提交整份表单（字段都没变）→ 不应产生落盘
+    const noop = await api.post('/config/update', {
+      strategy: cfg.strategy,
+      defaultModel: cfg.defaultModel,
+      zdr: cfg.zdr,
+      upstreamProxy: cfg.upstreamProxy,
+      logLevel: cfg.logLevel,
+      logFile: cfg.logFile,
+      apiBase: cfg.apiBase,
+      projectSlug: cfg.projectSlug,
+    });
+    assert.equal(noop.status, 200);
+    assert.ok(!/已保存到 data\/settings\.json/.test((await noop.json()).message || ''),
+      '没有任何字段变化时不应声称已保存');
+    assert.ok(!existsSync(join(workdir, 'data', 'settings.json')),
+      '没有任何字段变化时不该写出 settings.json');
+
+    // 2) 只改一个字段 → settings.json 只应包含这一个
+    await api.post('/config/update', {
+      strategy: 'fill',
+      defaultModel: cfg.defaultModel,
+      zdr: cfg.zdr,
+      logLevel: cfg.logLevel,
+      apiBase: cfg.apiBase,
+      projectSlug: cfg.projectSlug,
+    });
+    const settings = JSON.parse(readFileSync(join(workdir, 'data', 'settings.json'), 'utf-8'));
+    assert.deepEqual(Object.keys(settings), ['strategy'], '只落盘真正变化的字段');
+    assert.equal(settings.strategy, 'fill');
+  } finally {
+    await proxy.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+// ── ⑫ 日志 ───────────────────────────────────────────
 
 test('日志接口返回运行日志，级别过滤生效', async () => {
   const s = await setup({ env: BASE_ENV });

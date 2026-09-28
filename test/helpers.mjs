@@ -92,6 +92,19 @@ export async function startMockUpstream(opts = {}) {
     generateCount: () => seen.filter(s => s.url === '/alpha/generate').length };
 }
 
+/**
+ * 预置一个工作目录的 config.json（与 startProxy 内部写法完全一致）。
+ * 需要在代理启动**之前**准备 config.json 的用例（例如验证分层优先级）用它。
+ */
+export function seedConfig(workdir, overrides = {}) {
+  const template = ['config.json', 'config.json.example']
+    .map(f => join(REPO, f)).find(existsSync);
+  if (!template) throw new Error('repo has neither config.json nor config.json.example');
+  const cfg = { ...JSON.parse(readFileSync(template, 'utf8')), proxyKey: '', apiKey: '', ...overrides };
+  writeFileSync(join(workdir, 'config.json'), JSON.stringify(cfg, null, 2) + '\n');
+  return cfg;
+}
+
 /** 在临时 cwd 中启动代理（复刻真实部署：proxy.mjs 与 config.json 同目录）。 */
 export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   const port = await allocPort();
@@ -107,14 +120,9 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   if (!existsSync(join(workdir, 'config.json'))) {
     // 本 fork 把配置模板改名为 config.json.example，且 config.json 不入版本控制
     // （避免 proxyKey / apiKey 被提交），故优先用 config.json，缺失时回退到模板。
-    // 模板里的 proxyKey 是占位值 "your-proxy-key"，照抄会让代理进入严格鉴权模式；
-    // 而下面这些用例一律按透传模式（客户端自带 user_ Key）发请求，因此回退时清掉它。
-    const template = ['config.json', 'config.json.example']
-      .map(f => join(REPO, f)).find(existsSync);
-    if (!template) throw new Error('repo has neither config.json nor config.json.example');
-    const cfg = JSON.parse(readFileSync(template, 'utf8'));
-    cfg.proxyKey = '';
-    writeFileSync(join(workdir, 'config.json'), JSON.stringify(cfg, null, 2) + '\n');
+    // seedConfig 会把 proxyKey / apiKey 清空：这些用例按透传模式（客户端自带 user_ Key）
+    // 发请求，模板若带上口令会直接进入严格鉴权模式。
+    seedConfig(workdir);
   }
   const child = spawn(process.execPath, ['proxy.mjs'], {
     cwd: workdir,

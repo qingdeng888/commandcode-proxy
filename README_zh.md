@@ -14,13 +14,22 @@
 
 ```bash
 cp config.json.example config.json   # 首次：复制配置模板再按需修改
-npm start        # 启动（默认监听 http://0.0.0.0:3050）
-npm run dev      # watch 模式（proxy.mjs 与 config.json 修改自动重启）
+ADMIN_PASSWORD=你的管理密码 npm start   # 启动（默认监听 http://0.0.0.0:3050）
+# 然后打开 http://127.0.0.1:3050/admin/ 在网页里添加 Command Code Key
 ```
 
-> 仓库只提供 `config.json.example` 模板，**不含 `config.json`**。若未复制，程序会回退到内置默认值（端口 `3000`、无访问保护、无上游 Key）。
+> 模板里 `proxyKey` 与 `apiKey` 都是**空值**（= 功能未启用），且模板不含任何占位口令 ——
+> 照抄一份不会莫名其妙进入严格鉴权模式，更不会把公开已知的字符串当密码用。
+> 三种给 Key 的方式任选：
+> 1. **网页后台**（推荐）：`/admin/` 添加，写入 `data/keys.json`，改完立即生效；
+> 2. `config.json` 的 `apiKey`（字符串或数组）；
+> 3. 环境变量 `CC_API_KEY`（多个用英文逗号分隔）。
+>
+> 后两种会以**只读**条目出现在后台，可在后台一键「导入」为可管理条目。
 
-未启用访问保护时，API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
+未启用数据面访问保护（`proxyKey` 为空）时，API Key 由客户端通过 `Authorization` 请求头
+（Anthropic SDK 可用 `x-api-key`）传入，**无需写入配置文件**。Key 必须以 `user_` 开头
+（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
 
 ```bash
 curl http://127.0.0.1:3050/v1/chat/completions \
@@ -28,6 +37,9 @@ curl http://127.0.0.1:3050/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+> 监听 `0.0.0.0` 时这意味着**任何能访问到的人都可以借这套代理调用**（用他自己的 Key）。
+> 想只允许持口令的人使用，就设置 `proxyKey`，见[访问保护](#访问保护)。
 
 ## 文件结构
 
@@ -89,6 +101,9 @@ commandcode/
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+
+> 📌 `config.json` 是**部署期输入**。后台（`/admin/`）改动的是 `data/settings.json`，
+> 不会改写这个文件 —— 所以 Docker 里它可以安全地只读挂载。分层优先级见 [Web 管理后台](#web-管理后台)。
 
 ### 环境变量
 
@@ -232,7 +247,8 @@ ADMIN_PASSWORD=你的管理密码 npm start
 - 登录失败限速：同一来源 15 分钟内失败 5 次锁定 15 分钟（参考实现没有这一层，而后台常被暴露在 `0.0.0.0` 上）。
 - 会话 Cookie：`admin_session`、`HttpOnly`、`SameSite=Lax`、24 小时不滑动续期，重启后需重新登录。
 
-> ⚠️ 后台**没有 HTTPS**。公网部署务必套一层反向代理并启用 TLS，否则密码是明文传输的。
+> 后台自身不提供 TLS，与参考项目一致 —— 局域网内自用无需额外处理。
+> 若确实要暴露到公网，再套一层反向代理加 HTTPS（密码是明文提交的）。
 
 ### 功能
 
@@ -305,19 +321,31 @@ ADMIN_PASSWORD=你的管理密码 npm start
 | 改动 | 生效方式 |
 |------|----------|
 | 增删改 Key、启停 | 下一个请求立即生效（`keys.json` 立即落盘）|
-| 轮询策略 / 默认模型 / ZDR / 日志级别 | 立即生效 |
+| 轮询策略 / 默认模型 / ZDR / 日志级别 | 立即生效，写入 `data/settings.json` |
 | 上游 HTTP 代理 | 立即重建隧道（后续请求走新地址）|
 | `proxyKey` | 立即生效 |
 | 端口 / 监听地址 | **需重启**（后台会提示）|
 
+设置改动写进 **`data/settings.json`**，而**不是** `config.json`。原因是 Docker 里
+`config.json` 是**单文件挂载**（且是 `:ro`），而原子写用「临时文件 + rename」——
+单文件挂载点上 `rename` 会直接 `EBUSY`，改动只会进内存、宿主文件纹丝不动，容器重建即丢失。
+`data/` 是目录挂载，rename 正常，所以可变状态一律放那里（参考项目也是这个架构）。
+`config.json` 因此可以安全地保持只读，它同时放着 `proxyKey` 等敏感字段。
+
+**配置分层优先级**：`环境变量` > `data/settings.json`（后台写入）> `config.json` > 内置默认值。
+后台只写**被改动的字段**（稀疏覆盖），没碰过的字段仍然听 `config.json` 的。
+`GET /admin/api/config` 会返回每个字段的来源（`settingSources`），后台改动若与
+`config.json` 冲突，保存时会明确提示是后台设置优先。
+
 手工编辑 `config.json` 也会热加载（每 3 秒轮询 mtime，不依赖 `fs.watch` 的跨平台可靠性）。
-注意**环境变量优先级最高**：若某字段由环境变量锁定，后台修改不会生效，接口会明确告知。
+被环境变量锁定的字段后台改不动（既不落盘也不改内存），提交时会明确列出是哪些字段。
 
 ### 数据文件
 
 | 文件 | 内容 | 权限 |
 |------|------|------|
 | `data/keys.json` | 后台添加的上游 Key（**明文**）| 600 |
+| `data/settings.json` | 后台改过的设置（稀疏覆盖）| 600 |
 | `data/.admin-auth.json` | 后台密码的 scrypt 哈希 | 600 |
 | `data/model-tests.json` | 最近一次批量模型测试结果 | 600 |
 
