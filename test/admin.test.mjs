@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setup, startProxy, allocPort, closeServer, seedConfig } from './helpers.mjs';
 import http from 'node:http';
-import { mkdtempSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -918,6 +918,142 @@ test('后台的模型测试也计入该 Key 的用量（否则只点测试的用
     assert.equal(after.tokensOutToday, 1);
     assert.ok(after.lastUsedAt, '应更新最后使用时间');
   } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('输入 token 拆成 命中/写缓存/未命中，且三桶之和恒等于输入总数', async () => {
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"ok"}',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":1000,'
+      + '"inputTokenDetails":{"noCacheTokens":100,"cacheReadTokens":850,"cacheWriteTokens":50},'
+      + '"cachedInputTokens":850,"outputTokens":20}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');   // 触发目录同步，确保 items 里已有该 Key
+    await proxy.post('/v1/chat/completions',
+      { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] },
+      { Authorization: `Bearer ${CATALOG_KEY}` });
+
+    const usage = (await (await api.get('/usage')).json()).data;
+    const row = usage.items[0];
+    assert.equal(row.tokensInToday, 1000, '输入总数');
+    assert.equal(row.cacheReadToday, 850, '缓存命中');
+    assert.equal(row.cacheWriteToday, 50, '写入缓存');
+    assert.equal(row.cacheMissToday, 100, '未命中');
+    assert.equal(row.cacheReadToday + row.cacheWriteToday + row.cacheMissToday, row.tokensInToday,
+      '三桶之和必须等于输入总数（口径不能重叠也不能漏）');
+    assert.equal(row.cacheHitRateToday, 0.85, '命中率 = 命中 / 输入总数');
+
+    const sum = usage.summary;
+    assert.equal(sum.inToday, 1000);
+    assert.equal(sum.cacheReadToday, 850);
+    assert.equal(sum.cacheMissToday, 100);
+    assert.equal(sum.cacheHitRateToday, 0.85);
+
+    const stats = (await (await api.get('/stats')).json()).data;
+    assert.equal(stats.tokens.cacheReadToday, 850, '仪表盘 stats 也要带命中明细');
+    assert.equal(stats.tokens.cacheHitRateToday, 0.85);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('上游没给缓存明细时全部归入未命中（和仍等于输入总数）', async () => {
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"ok"}',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":500,"outputTokens":10}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    await proxy.post('/v1/chat/completions',
+      { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] },
+      { Authorization: `Bearer ${CATALOG_KEY}` });
+    const row = (await (await api.get('/usage')).json()).data.items[0];
+    assert.equal(row.tokensInToday, 500);
+    assert.equal(row.cacheReadToday, 0, '没有明细就没有命中');
+    assert.equal(row.cacheMissToday, 500, '缺明细时全部算未命中，不能凭空造出命中');
+    assert.equal(row.cacheHitRateToday, 0);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('后台模型测试的 token 也按缓存拆桶', async () => {
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"ok"}',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":200,'
+      + '"inputTokenDetails":{"noCacheTokens":40,"cacheReadTokens":160},"cachedInputTokens":160,"outputTokens":5}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    await api.post('/models/test', { model: list.models[0].id });
+    const row = (await (await api.get('/usage')).json()).data.items[0];
+    assert.equal(row.tokensInToday, 200);
+    assert.equal(row.cacheReadToday, 160, '探测也要拆出命中');
+    assert.equal(row.cacheMissToday, 40);
+    assert.equal(row.cacheHitRateToday, 0.8);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('历史数据（没有缓存字段）也要满足 命中+写+未命中 === 输入总数', async () => {
+  // 模拟本功能上线前的 keys.json：一个 Key + 只记了 tokensIn 的旧格式用法
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-legacy-'));
+  seedConfig(workdir);
+  mkdirSync(join(workdir, 'data'), { recursive: true });
+  const legacyKey = {
+    id: 'k_legacy0001', key: 'user_legacy00000000000000000000', label: '旧数据',
+    enabled: true, createdAt: new Date().toISOString(),
+  };
+  writeFileSync(join(workdir, 'data', 'keys.json'), JSON.stringify({
+    version: 1,
+    keys: [legacyKey],
+    stats: {
+      [legacyKey.id]: {
+        usage: {
+          date: new Date().toISOString().slice(0, 10),
+          requestsToday: 3, requestsTotal: 3, failedToday: 0, failedTotal: 0,
+          tokensInToday: 49667, tokensInTotal: 49667,   // 旧格式：没有 cache* 字段
+          tokensOutToday: 120, tokensOutTotal: 120,
+        },
+        health: { status: 'unknown', checkedAt: null, latencyMs: null, message: '' },
+        cooldownUntil: null, lastError: null, lastUsedAt: null,
+      },
+    },
+  }, null, 2));
+
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    cwd: workdir,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const item = (await (await api.get('/usage')).json()).data.items.find(i => i.keyId === legacyKey.id);
+    assert.ok(item, '旧数据里的 Key 应被读出');
+    assert.equal(item.tokensInToday, 49667, '旧数据的总数要原样保留');
+    assert.equal(item.cacheReadToday, 0, '没有明细就没有命中');
+    assert.equal(item.cacheMissToday, 49667, '没给明细就全部算未命中，不能凭空造出命中');
+    assert.equal(item.cacheReadToday + item.cacheWriteToday + item.cacheMissToday, item.tokensInToday,
+      '不变量对历史数据也必须成立');
+    assert.equal(item.cacheHitRateToday, 0);
+  } finally {
+    await proxy.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 // ── ⑩a 2API Key（下游客户端凭证）与上游 Key 的边界 ──────

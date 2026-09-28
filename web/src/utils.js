@@ -92,6 +92,13 @@ function trimZero(s) {
 }
 
 /** 模型上下文长度：1000000 → 1M，200000 → 200K。 */
+/** 0.6712 → "67.1%"（缓存命中率这类比例用） */
+export function fmtPct(rate) {
+  const n = Number(rate)
+  if (!Number.isFinite(n)) return '-'
+  return `${(n * 100).toFixed(1)}%`
+}
+
 export function fmtContext(n) {
   if (isMissing(n)) return MISSING
   const num = Number(n)

@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { loadStats } from '../store'
 import { toast } from '../toast'
-import { SOURCE_LABELS, fmtDateTime, fmtNum, fmtTokens } from '../utils'
+import { SOURCE_LABELS, fmtDateTime, fmtNum, fmtPct, fmtTokens } from '../utils'
 import StatCard from '../components/StatCard.vue'
 
 const data = ref(null)
@@ -86,6 +86,12 @@ onMounted(() => {
         tone="yellow"
         :sub="`累计 ${fmtTokens(summary.inTotal)} / ${fmtTokens(summary.outTotal)}`"
       />
+      <StatCard
+        :value="`${fmtTokens(summary.cacheReadToday)} / ${fmtTokens(summary.inToday)}`"
+        label="输入缓存命中 / 输入总数（今日）"
+        tone="green"
+        :sub="`命中率 ${fmtPct(summary.cacheHitRateToday)} · 未命中 ${fmtTokens(summary.cacheMissToday)}${summary.cacheWriteToday ? ' · 写缓存 ' + fmtTokens(summary.cacheWriteToday) : ''}`"
+      />
       <StatCard :value="fmtNum(items.length)" label="统计中的 Key" tone="green" sub="按 Key 维度统计" />
     </div>
 
@@ -106,8 +112,8 @@ onMounted(() => {
               <th>今日失败</th>
               <th>累计请求</th>
               <th>累计失败</th>
-              <th>今日 Tokens（入/出）</th>
-              <th>累计 Tokens（入/出）</th>
+              <th>今日 Tokens 入/出<br /><span class="text-dim" style="font-size: 10px">缓存命中 / 未命中</span></th>
+              <th>累计 Tokens 入/出<br /><span class="text-dim" style="font-size: 10px">缓存命中</span></th>
               <th>最后使用</th>
               <th>操作</th>
             </tr>
@@ -131,8 +137,18 @@ onMounted(() => {
               </td>
               <td class="mono">{{ fmtNum(it.requestsTotal) }}</td>
               <td class="mono" :class="it.failedTotal ? 'text-danger' : ''">{{ fmtNum(it.failedTotal) }}</td>
-              <td class="mono">{{ fmtTokens(it.tokensInToday) }} / {{ fmtTokens(it.tokensOutToday) }}</td>
-              <td class="mono">{{ fmtTokens(it.tokensInTotal) }} / {{ fmtTokens(it.tokensOutTotal) }}</td>
+              <td class="mono">
+                {{ fmtTokens(it.tokensInToday) }} / {{ fmtTokens(it.tokensOutToday) }}
+                <div class="text-dim" style="font-size: 11px">
+                  命中 {{ fmtTokens(it.cacheReadToday) }}（{{ fmtPct(it.cacheHitRateToday) }}）· 未命中 {{ fmtTokens(it.cacheMissToday) }}<template v-if="it.cacheWriteToday"> · 写 {{ fmtTokens(it.cacheWriteToday) }}</template>
+                </div>
+              </td>
+              <td class="mono">
+                {{ fmtTokens(it.tokensInTotal) }} / {{ fmtTokens(it.tokensOutTotal) }}
+                <div class="text-dim" style="font-size: 11px">
+                  命中 {{ fmtTokens(it.cacheReadTotal) }}（{{ fmtPct(it.cacheHitRateTotal) }}）
+                </div>
+              </td>
               <td class="mono">{{ fmtDateTime(it.lastUsedAt) }}</td>
               <td style="white-space: nowrap">
                 <button

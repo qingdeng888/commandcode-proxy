@@ -617,9 +617,12 @@ async function probeModel({ key, model, message, mode = 'single' }) {
     keyPool.recordRequest(key, { ok: result.category === 'ok' });
     const u = result.usage;
     if (u) {
+      const { cacheRead, cacheWrite } = splitInputTokens(u);
       keyPool.recordTokens(key, {
         tokensIn: Number(u.inputTokens) || 0,
         tokensOut: Number(u.outputTokens) || 0,
+        cacheRead,
+        cacheWrite,
       });
     }
   } catch { /* 记账失败不影响探测结果 */ }
@@ -1836,17 +1839,29 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
  *   真正的记账挂在 response 的 finish/close 钩子上，配合一次性守卫保证恰好记一次。
  * 上游没给 token 数（0/0）时不消耗守卫，等后续拿到真实值再记。
  */
+/**
+ * 从上游 usage 里拆出输入的三桶。
+ * 字段来源（实测 CC）：inputTokenDetails.cacheReadTokens / cacheWriteTokens / noCacheTokens，
+ * 顶层 cachedInputTokens 是 cacheReadTokens 的同义字段（老版本可能只给这个）。
+ * 缺明细时返回 0，由 recordTokens 把差额归入"未命中"，保证三桶之和恒等于输入总数。
+ */
+function splitInputTokens(u) {
+  const d = (u && u.inputTokenDetails) || {};
+  const read = Number(d.cacheReadTokens ?? u?.cachedInputTokens) || 0;
+  const write = Number(d.cacheWriteTokens) || 0;
+  return { cacheRead: read, cacheWrite: write };
+}
+
 function attachUsageRecording(res, key) {
   const box = { usage: null };
   let done = false;
 
   const flush = () => {
     if (done || !box.usage) return;
-    const tokensIn = Number(box.usage.inputTokens) || 0;
-    const tokensOut = Number(box.usage.outputTokens) || 0;
+    const { inputTokens: tokensIn = 0, outputTokens: tokensOut = 0, cacheRead = 0, cacheWrite = 0 } = box.usage;
     if (tokensIn <= 0 && tokensOut <= 0) return;
     done = true;
-    keyPool.recordTokens(key, { tokensIn, tokensOut });
+    keyPool.recordTokens(key, { tokensIn, tokensOut, cacheRead, cacheWrite });
   };
 
   res.once('finish', flush);
@@ -1857,7 +1872,8 @@ function attachUsageRecording(res, key) {
     const tokensIn = u.inputTokens ?? u.input_tokens;
     const tokensOut = u.outputTokens ?? u.output_tokens;
     if (tokensIn === undefined && tokensOut === undefined) return;
-    box.usage = { inputTokens: tokensIn, outputTokens: tokensOut };
+    const { cacheRead, cacheWrite } = splitInputTokens(u);
+    box.usage = { inputTokens: tokensIn, outputTokens: tokensOut, cacheRead, cacheWrite };
   };
 }
 

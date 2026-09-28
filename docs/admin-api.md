@@ -98,7 +98,11 @@
   "keys":    { "total": 3, "enabled": 3, "cooldown": 0, "unhealthy": 0 },
   "models":  { "total": 82, "lastSyncAt": "2026-09-28T06:00:00.000Z", "syncing": false },
   "requests":{ "today": 120, "total": 8300, "failedToday": 2, "inflight": 1 },
-  "tokens":  { "inToday": 1, "inTotal": 1, "outToday": 1, "outTotal": 1 },
+  "tokens":  { "inToday": 1, "inTotal": 1, "outToday": 1, "outTotal": 1,
+               "cacheReadToday": 1, "cacheReadTotal": 1,
+               "cacheWriteToday": 1, "cacheWriteTotal": 1,
+               "cacheMissToday": 1, "cacheMissTotal": 1,
+               "cacheHitRateToday": 0.85, "cacheHitRateTotal": 0.85 },
   "admin":   { "address": "http://0.0.0.0:3050", "dataDir": "/app/data" }
 } }
 ```
@@ -306,14 +310,38 @@ Key 列表项（下称 `KeyItem`）：
                "failedToday": 0, "failedTotal": 3,
                "successToday": 12, "successTotal": 337,
                "tokensInToday": 100, "tokensInTotal": 2000,
+               "cacheReadToday": 85, "cacheReadTotal": 1700,
+               "cacheWriteToday": 5,  "cacheWriteTotal": 100,
+               "cacheMissToday": 10,  "cacheMissTotal": 200,
+               "cacheHitRateToday": 0.85, "cacheHitRateTotal": 0.85,
                "tokensOutToday": 50,  "tokensOutTotal": 900,
                "lastUsedAt": "..." } ],
   "summary": { "requestsToday": 12, "requestsTotal": 340,
                "failedToday": 0, "failedTotal": 3,
                "inToday": 100, "inTotal": 2000,
+               "cacheReadToday": 85, "cacheReadTotal": 1700,
+               "cacheWriteToday": 5, "cacheWriteTotal": 100,
+               "cacheMissToday": 10, "cacheMissTotal": 200,
+               "cacheHitRateToday": 0.85, "cacheHitRateTotal": 0.85,
                "outToday": 50,  "outTotal": 900 }
 } }
 ```
+
+**输入 token 按缓存分三桶**（上游本来就分开给，只是要显式采集）：
+
+| 字段 | 含义 |
+|------|------|
+| `cacheRead*` | **缓存命中 / 缓存读取**（最便宜，最能反映前缀缓存有没有生效）|
+| `cacheWrite*` | 写入缓存（首次建立缓存，计费口径通常又不同）|
+| `cacheMiss*` | 既未命中也没写入（真正的"新"输入）|
+
+不变量：**`cacheRead + cacheWrite + cacheMiss === tokensIn`**（`tokensIn*` 是输入总数，含缓存部分）。
+上游没给明细时全部归入 `cacheMiss` —— 宁可算作未命中，也不凭空造出命中。
+
+字段来源（实测 Command Code）：`inputTokenDetails.cacheReadTokens` / `cacheWriteTokens` / `noCacheTokens`，
+顶层 `cachedInputTokens` 是 `cacheReadTokens` 的同义字段（老版本可能只给这个）。
+
+`cacheHitRate*` = `cacheRead / tokensIn`，保留 4 位小数，便于一眼看出缓存效果。
 
 ### `POST /admin/api/usage/reset` （保护）
 请求：`{ "keyId": "k_...", "scope": "today" | "all" }`

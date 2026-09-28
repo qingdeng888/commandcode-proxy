@@ -23,6 +23,7 @@ import {
   fmtDateTime,
   fmtLatency,
   fmtNum,
+  fmtPct,
   fmtTokens,
   fmtUptime,
 } from '../utils'
@@ -203,7 +204,7 @@ onUnmounted(() => {
         :value="`${fmtTokens(tokens.inToday)} / ${fmtTokens(tokens.outToday)}`"
         label="今日 Tokens"
         tone="yellow"
-        :sub="`输入 / 输出 · 累计 ${fmtTokens(tokens.inTotal)} / ${fmtTokens(tokens.outTotal)}`"
+        :sub="`输入 / 输出 · 缓存命中 ${fmtPct(tokens.cacheHitRateToday)}（${fmtTokens(tokens.cacheReadToday)}）· 累计 ${fmtTokens(tokens.inTotal)} / ${fmtTokens(tokens.outTotal)}`"
       />
       <StatCard
         :value="fmtNum(modelsInfo.total)"
