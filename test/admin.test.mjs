@@ -4,9 +4,10 @@
 // 只能靠真实起进程 + 真实 HTTP 调用来验证。全部走 mock 上游，不需要真 Key。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { setup, startProxy, allocPort, closeServer, seedConfig } from './helpers.mjs';
+import { setup, startProxy, allocPort, closeServer, seedConfig, REPO } from './helpers.mjs';
 import http from 'node:http';
 import { mkdtempSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { maskKey } from '../lib/keys.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -852,6 +853,116 @@ test('设置接口可热改策略与默认模型，非法值被拒', async () =>
     const badProxy = await api.post('/config/update', { upstreamProxy: 'socks5://127.0.0.1:1080' });
     assert.equal(badProxy.status, 400, '不支持的代理协议必须被拒');
   } finally { await proxy.kill(); await upstream.close(); }
+});
+
+// ── ⑨b 上游 Key 的停用 / 启用 ──────────────────────────
+
+test('上游 Key 停用后立即退出轮询池，重新启用后恢复（无需重启）', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    // 严格模式：客户端只给 proxyKey，上游凭证来自池子 —— 这样停用才会影响数据面
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, PROXY_KEY: 'client-secret', CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  const H = { Authorization: 'Bearer client-secret' };
+  const CHAT = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] };
+  try {
+    const api = await authed(proxy);
+    // env/config 来源是只读的（服务端会拒绝修改并说明原因），先导入成可管理的
+    const readonly = await api.post('/keys/update', { id: (await (await api.get('/keys')).json()).data.keys[0].id, enabled: false });
+    assert.equal(readonly.status, 400, '只读来源不能直接停用');
+    assert.match((await readonly.json()).error, /环境变量/);
+
+    await api.post('/keys/import');
+    const keyId = (await (await api.get('/keys')).json()).data.keys.find(k => k.source === 'ui').id;
+
+    // 默认启用：请求走池子里的 Key
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, H)).status, 200);
+    assert.equal(upstream.lastGenerate().headers.authorization, `Bearer ${CATALOG_KEY}`);
+
+    // 停用
+    const off = await api.post('/keys/update', { id: keyId, enabled: false });
+    assert.equal(off.status, 200);
+    const afterOff = (await (await api.get('/keys')).json()).data.keys.find(k => k.id === keyId);
+    assert.equal(afterOff.enabled, false, '列表要反映停用状态');
+    assert.equal((await (await api.get('/stats')).json()).data.keys.enabled, 0, '统计里的启用数应归零');
+
+    // 停用后：没有可用上游 Key → 明确报 500，而不是照样打上游
+    const before = upstream.generateCount();
+    const blocked = await proxy.post('/v1/chat/completions', CHAT, H);
+    assert.equal(blocked.status, 500, '全部停用时必须是明确失败');
+    assert.equal(upstream.generateCount(), before, '停用的 Key 不应再被拿去请求上游');
+
+    // 重新启用 → 立即恢复
+    assert.equal((await api.post('/keys/update', { id: keyId, enabled: true })).status, 200);
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, H)).status, 200);
+    assert.equal((await (await api.get('/stats')).json()).data.keys.enabled, 1);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('多 Key 下停用其中一个：该 Key 彻底不再被选中，其余照常服务', async () => {
+  const KEY_A = 'user_keyA000000000000000000000';
+  const KEY_B = 'user_keyB000000000000000000000';
+  const upstream = await startCatalogUpstream();
+  // 用显式 cwd，便于最后检查落盘文件（startProxy 不传 cwd 时会自建临时目录）
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-keytoggle-'));
+  seedConfig(workdir);
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    cwd: workdir,
+    env: { ...BASE_ENV, CC_API_KEY: `${KEY_A},${KEY_B}`, PROXY_KEY: 'client-secret', CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  const H = { Authorization: 'Bearer client-secret' };
+  const CHAT = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] };
+  try {
+    const api = await authed(proxy);
+    assert.equal((await (await api.get('/keys')).json()).data.keys.length, 2);
+
+    // config/env 来源只读，先导入成可管理的
+    await api.post('/keys/import');
+    const uiKeys = (await (await api.get('/keys')).json()).data.keys.filter(k => k.source === 'ui');
+    assert.equal(uiKeys.length, 2);
+    const idA = uiKeys.find(k => k.keyMasked === maskKey(KEY_A))?.id;
+    const idB = uiKeys.find(k => k.keyMasked === maskKey(KEY_B))?.id;
+    assert.ok(idA && idB, `两个 Key 都应可定位（${JSON.stringify(uiKeys.map(k => k.keyMasked))}）`);
+
+    // 停用 A
+    assert.equal((await api.post('/keys/update', { id: idA, enabled: false })).status, 200);
+
+    // 连打多次，确保被停用的那个再也不出现
+    const used = new Set();
+    for (let i = 0; i < 12; i++) {
+      assert.equal((await proxy.post('/v1/chat/completions', CHAT, H)).status, 200);
+      used.add(upstream.lastGenerate().headers.authorization.replace('Bearer ', ''));
+    }
+    assert.deepEqual([...used], [KEY_B], `只应使用仍启用的那个 Key，实际：${[...used]}`);
+
+    // 停用状态要落盘（重启后仍生效）
+    const persisted = JSON.parse(readFileSync(join(workdir, 'data', 'keys.json'), 'utf-8'));
+    assert.ok(persisted.keys.some(k => k.id === idA && k.enabled === false),
+      '停用状态应写入 keys.json');
+    assert.ok(persisted.keys.some(k => k.id === idB && k.enabled === true), '另一个应保持启用');
+
+    // 重启同一工作目录 → 停用依然生效
+  } finally { await proxy.kill(); }
+
+  const proxy2 = await startProxy({
+    upstreamPort: upstream.port,
+    cwd: workdir,
+    env: { ...BASE_ENV, CC_API_KEY: `${KEY_A},${KEY_B}`, PROXY_KEY: 'client-secret', CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const used = new Set();
+    for (let i = 0; i < 8; i++) {
+      assert.equal((await proxy2.post('/v1/chat/completions', CHAT, H)).status, 200);
+      used.add(upstream.lastGenerate().headers.authorization.replace('Bearer ', ''));
+    }
+    assert.deepEqual([...used], [KEY_B], '重启后停用状态仍应生效');
+  } finally {
+    await proxy2.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 // ── ⑩ 用量统计（token 记账）──────────────────────────

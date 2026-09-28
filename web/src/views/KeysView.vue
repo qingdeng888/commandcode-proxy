@@ -29,6 +29,9 @@ import {
 import CategoryBadge from '../components/CategoryBadge.vue'
 import TestResultBox from '../components/TestResultBox.vue'
 
+const enabledCount = computed(() => (keysState.list || []).filter((k) => k.enabled !== false).length)
+const disabledCount = computed(() => (keysState.list || []).length - enabledCount.value)
+
 const busy = reactive({ add: false, strategy: false, rowId: '', revealingId: '', testingId: '', importingId: '' })
 const addForm = reactive({ key: '', label: '' })
 const editing = reactive({ id: '', label: '', enabled: true })
@@ -371,7 +374,9 @@ onUnmounted(() => {
     <div class="section">
       <div class="section-title">
         🔑 Key 列表
-        <span class="probe-pill">共 {{ fmtNum(rows.length) }} 个</span>
+        <span class="probe-pill">
+          共 {{ fmtNum(rows.length) }} 个 · 启用 {{ fmtNum(enabledCount) }} · 停用 {{ fmtNum(disabledCount) }}
+        </span>
       </div>
       <div class="table-wrap">
         <table>
@@ -394,7 +399,7 @@ onUnmounted(() => {
                 {{ keysState.loading ? '加载中…' : '暂无 Key，请在上方添加' }}
               </td>
             </tr>
-            <tr v-for="k in rows" :key="k.id">
+            <tr v-for="k in rows" :key="k.id" :class="{ 'row-disabled': !k.enabled }">
               <td>
                 <span
                   class="key-display"
@@ -466,7 +471,31 @@ onUnmounted(() => {
                   <button class="btn btn-sm" style="margin-left: 6px" type="button" @click="cancelEdit">取消</button>
                 </template>
                 <template v-else>
-                  <button class="btn btn-sm btn-icon" type="button" title="显示 / 隐藏完整 Key" @click="reveal(k)">
+                  <!-- 一键停用 / 启用：停用后该 Key 立即从轮询池剔除（正在冷却或已失败的请求不受影响）。
+                       只读来源（config / env）点了会由服务端返回原因，比直接禁用按钮更有帮助。 -->
+                  <button
+                    v-if="k.enabled"
+                    class="btn btn-sm btn-danger"
+                    type="button"
+                    :title="isReadonly(k) ? 'config / env 来源只读，导入后可停用' : '停用该 Key（立即从轮询池剔除）'"
+                    :disabled="busy.rowId === k.id"
+                    @click="onToggle(k, false)"
+                  >
+                    <span v-if="busy.rowId === k.id" class="loading"></span>
+                    <span v-else>⏸ 停用</span>
+                  </button>
+                  <button
+                    v-else
+                    class="btn btn-sm btn-success"
+                    type="button"
+                    :title="isReadonly(k) ? 'config / env 来源只读，导入后可启用' : '启用该 Key（重新加入轮询池）'"
+                    :disabled="busy.rowId === k.id"
+                    @click="onToggle(k, true)"
+                  >
+                    <span v-if="busy.rowId === k.id" class="loading"></span>
+                    <span v-else>▶ 启用</span>
+                  </button>
+                  <button class="btn btn-sm btn-icon" style="margin-left: 6px" type="button" title="显示 / 隐藏完整 Key" @click="reveal(k)">
                     {{ revealed[k.id] ? '🙈' : '👁' }}
                   </button>
                   <button
@@ -517,7 +546,13 @@ onUnmounted(() => {
         </table>
       </div>
       <div class="section-body" style="padding-top: 0">
+        <div v-if="!enabledCount && rows.length" class="hint text-danger">
+          <strong>当前没有任何启用的上游 Key</strong> —— 所有 <code>/v1/*</code> 请求都会返回 500。
+          请至少启用一个（点行内的 <strong>▶ 启用</strong>）。
+        </div>
         <div class="hint">
+          停用只是把该 Key <strong>从轮询池剔除</strong>，配置与用量统计都保留，随时可再启用；
+          删除才会真正移除。<br />
           列表中的 Key 默认脱敏，点击 👁 会调用 <code>keys/reveal</code> 获取完整值，5 秒后自动重新脱敏。
         </div>
       </div>
