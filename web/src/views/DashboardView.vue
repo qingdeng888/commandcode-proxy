@@ -9,9 +9,13 @@ import {
   loadStats,
   models,
   now,
+  loadTestPrompt,
   refreshModels,
+  resetTestPrompt,
   startBatch,
   stats,
+  testMessagePayload,
+  testPrompt,
 } from '../store'
 import { toast } from '../toast'
 import {
@@ -116,13 +120,13 @@ async function runTest() {
   try {
     let data = null
     if (testMode.value === 'model') {
-      const body = { model: testModel.value }
+      const body = { model: testModel.value, ...testMessagePayload() }
       if (testKeyId.value) body.keyId = testKeyId.value
       const res = await api('POST', '/models/test', body)
       data = res.data
     } else {
       const raw = testKeyInput.value.trim()
-      const body = raw ? { key: raw } : { id: testKeyId.value }
+      const body = { ...(raw ? { key: raw } : { id: testKeyId.value }), ...testMessagePayload() }
       const res = await api('POST', '/keys/test', body)
       data = res.data
     }
@@ -149,6 +153,7 @@ onMounted(() => {
   loadStats()
   loadModels()
   loadKeys()
+  loadTestPrompt()
   statsTimer = setInterval(() => loadStats(true), 10000)
 })
 
@@ -257,6 +262,26 @@ onUnmounted(() => {
           <div class="field">
             <label>或直接输入 Key（可选）</label>
             <input v-model="testKeyInput" type="text" placeholder="user_…（填写后优先使用）" class="mono" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="field" style="flex: 1 1 100%">
+            <label>
+              测试消息
+              <button class="btn btn-sm" type="button" style="margin-left: 8px" @click="resetTestPrompt">
+                ↺ 恢复默认
+              </button>
+            </label>
+            <input
+              v-model="testPrompt.message"
+              type="text"
+              :maxlength="testPrompt.maxLen"
+              placeholder="留空则使用默认提示词"
+            />
+            <div class="hint" style="margin-top: 6px">
+              默认与参考项目一致：<code>{{ testPrompt.defaultMessage }}</code>；可改成任意内容用于验证链路。
+            </div>
           </div>
         </div>
 

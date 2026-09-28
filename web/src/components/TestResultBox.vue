@@ -34,6 +34,9 @@ const headline = computed(() => {
       <span v-if="result.checkedAt" class="stat-mini">检测于 {{ fmtDateTime(result.checkedAt) }}</span>
     </div>
     <div class="hint">{{ result.message || '（上游未返回说明）' }}</div>
+    <div v-if="result.prompt" class="hint" style="margin-top: 4px">
+      发送内容：<code>{{ result.prompt }}</code>
+    </div>
     <pre
       v-if="result.outputPreview"
       class="log-data"

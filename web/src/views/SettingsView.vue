@@ -137,7 +137,7 @@ onMounted(() => {
   <div>
     <h2>
       ⚙️ 设置
-      <span class="probe-pill">写入 config.json（原子替换）</span>
+      <span class="probe-pill">写入 data/settings.json（后台设置层，原子替换）</span>
       <button class="btn btn-sm" style="margin-left: auto" type="button" :disabled="loading" @click="loadConfig">
         <span v-if="loading" class="loading"></span>
         {{ loading ? '加载中…' : '🔄 重新加载' }}

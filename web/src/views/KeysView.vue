@@ -1,7 +1,17 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { api } from '../api'
-import { keysState, loadKeys, loadStats, now, updateStrategy } from '../store'
+import {
+  keysState,
+  loadKeys,
+  loadStats,
+  loadTestPrompt,
+  now,
+  resetTestPrompt,
+  testMessagePayload,
+  testPrompt,
+  updateStrategy,
+} from '../store'
 import { toast } from '../toast'
 import {
   SOURCE_LABELS,
@@ -205,7 +215,7 @@ async function copyText(text) {
 async function testKey(k) {
   busy.testingId = k.id
   try {
-    const { data } = await api('POST', '/keys/test', { id: k.id })
+    const { data } = await api('POST', '/keys/test', { id: k.id, ...testMessagePayload() })
     if (!data) {
       toast.info('测试完成，但服务端未返回结果')
       return
@@ -263,6 +273,7 @@ function cooldownLeft(k) {
 }
 
 onMounted(() => {
+  loadTestPrompt()
   onMountedLoad()
   loadStats()
 })
@@ -295,6 +306,25 @@ onUnmounted(() => {
             <select v-model="strategy" :disabled="busy.strategy">
               <option v-for="opt in STRATEGY_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="field" style="flex: 1 1 100%">
+            <label>
+              测试消息
+              <button class="btn btn-sm" type="button" style="margin-left: 8px" @click="resetTestPrompt">
+                ↺ 恢复默认
+              </button>
+            </label>
+            <input
+              v-model="testPrompt.message"
+              type="text"
+              :maxlength="testPrompt.maxLen"
+              placeholder="留空则使用默认提示词"
+            />
+            <div class="hint" style="margin-top: 6px">
+              点 ⚡ 测试 Key 时发送的内容；默认：<code>{{ testPrompt.defaultMessage }}</code>
+            </div>
           </div>
         </div>
         <div class="hint">

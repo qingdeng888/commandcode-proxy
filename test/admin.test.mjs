@@ -313,6 +313,20 @@ async function startCatalogUpstream({ generateStatus = 200, generateBody = null,
     close: () => closeServer(server),
     lastGenerate: () => seen.filter(s => s.url === '/alpha/generate').pop() || null,
     generateCount: () => seen.filter(s => s.url === '/alpha/generate').length,
+    /** 上游实际收到的提示词（探测请求的信封 params.messages[0]） */
+    lastPrompt: () => {
+      const g = seen.filter(s => s.url === '/alpha/generate').pop();
+      if (!g) return null;
+      try {
+        const body = JSON.parse(g.raw);
+        const part = body?.params?.messages?.[0]?.content?.[0];
+        return part?.text ?? null;
+      } catch { return null; }
+    },
+    /** 所有探测请求收到的提示词，按顺序 */
+    allPrompts: () => seen
+      .filter(s => s.url === '/alpha/generate')
+      .map(s => { try { return JSON.parse(s.raw)?.params?.messages?.[0]?.content?.[0]?.text ?? null; } catch { return null; } }),
   };
 }
 
@@ -408,6 +422,83 @@ test('模型目录：无 Key 时回退静态列表，补上 Key 后立刻转为�
     assert.equal(second.models.length, 2, '应是 mock 上游给的两个模型，而不是静态列表');
     assert.equal(second.models[0].source, 'upstream');
     assert.ok(second.lastSyncAt, '应记录成功同步时间');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+// 回归：测试消息的默认值与参考项目一致，且支持自定义
+test('测试消息：默认「你是谁，出来干活了」，可自定义，越界被拒', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const models = (await (await api.get('/models')).json()).data;
+    const model = models.models[0].id;
+
+    // 1) 不传 message → 上游收到的应是参考项目那条默认提示词
+    const d1 = (await (await api.post('/models/test', { model })).json()).data;
+    assert.equal(upstream.lastPrompt(), '你是谁，出来干活了',
+      '默认提示词必须与参考项目一致');
+    assert.equal(d1.prompt, '你是谁，出来干活了', '响应里要回显实际发送的内容');
+
+    // 2) 传自定义 message → 原样发到上游
+    const d2 = (await (await api.post('/models/test', { model, message: '你好，做一次连通性检查' })).json()).data;
+    assert.equal(upstream.lastPrompt(), '你好，做一次连通性检查');
+    assert.equal(d2.prompt, '你好，做一次连通性检查');
+
+    // 3) 空白 message → 回落默认值（而不是发一个空提示词）
+    await api.post('/models/test', { model, message: '   ' });
+    assert.equal(upstream.lastPrompt(), '你是谁，出来干活了');
+
+    // 4) Key 测试走同一条提示词逻辑
+    const kid = (await (await api.post('/keys', { key: 'user_promptcheck00000000000000', label: 'P' })).json()).data.key.id;
+    const d4 = (await (await api.post('/keys/test', { id: kid, message: '来自 Key 测试的消息' })).json()).data;
+    assert.equal(upstream.lastPrompt(), '来自 Key 测试的消息');
+    assert.equal(d4.prompt, '来自 Key 测试的消息');
+    assert.equal(d4.ok, true);
+
+    // 5) 越界与类型校验
+    const tooLong = await api.post('/models/test', { model, message: 'x'.repeat(4001) });
+    assert.equal(tooLong.status, 400);
+    assert.match((await tooLong.json()).error, /过长/);
+
+    const wrongType = await api.post('/models/test', { model, message: 123 });
+    assert.equal(wrongType.status, 400);
+    assert.match((await wrongType.json()).error, /必须是字符串/);
+
+    // 6) 后台要能拿到默认值（前端据此预填，默认值只在后端定义一处）
+    const cfg = (await (await api.get('/config')).json()).data;
+    assert.equal(cfg.defaultTestMessage, '你是谁，出来干活了');
+    assert.equal(cfg.maxTestMessageLen, 4000);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('批量测试同样接受自定义测试消息', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');
+
+    const started = await api.post('/models/test-batch', { models: ['claude-sonnet-5', 'deepseek/deepseek-v4-flash'], message: '批量探测消息', concurrency: 2 });
+    assert.equal(started.status, 200);
+    assert.equal((await started.json()).data.prompt, '批量探测消息');
+
+    // 等批量跑完
+    for (let i = 0; i < 40; i++) {
+      const st = (await (await api.get('/models/test-status')).json()).data;
+      if (!st.running && st.done >= 2) break;
+      await new Promise(r => setTimeout(r, 150));
+    }
+    const prompts = upstream.allPrompts();
+    assert.ok(prompts.length >= 2, '批量测试应至少发出两次请求');
+    assert.ok(prompts.every(p => p === '批量探测消息'),
+      `每个模型都应收到自定义消息，实际：${JSON.stringify(prompts)}`);
   } finally { await proxy.kill(); await upstream.close(); }
 });
 

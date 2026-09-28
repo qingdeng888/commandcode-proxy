@@ -9,9 +9,13 @@ import {
   loadKeys,
   loadModels,
   models,
+  loadTestPrompt,
   pollBatchOnce,
   refreshModels,
+  resetTestPrompt,
   startBatch,
+  testMessagePayload,
+  testPrompt,
 } from '../store'
 import { toast } from '../toast'
 import {
@@ -74,7 +78,7 @@ async function testOne(m) {
   if (testingModel.value) return
   testingModel.value = m.id
   try {
-    const body = { model: m.id }
+    const body = { model: m.id, ...testMessagePayload() }
     if (testKeyId.value) body.keyId = testKeyId.value
     const { data } = await api('POST', '/models/test', body)
     if (!data) {
@@ -100,7 +104,7 @@ async function doBatchTest() {
   const count = list.value.length
   if (!window.confirm(`确定发起批量测试吗？\n将逐个向上游发送真实请求（当前目录 ${count} 个模型），会消耗真实额度。`)) return
   try {
-    const payload = { concurrency: Math.max(1, Number(concurrency.value) || 4) }
+    const payload = { concurrency: Math.max(1, Number(concurrency.value) || 4), ...testMessagePayload() }
     if (testKeyId.value) payload.keyId = testKeyId.value
     await startBatch(payload)
     toast.success('批量测试已启动')
@@ -123,6 +127,7 @@ async function doCancel() {
 }
 
 onMounted(() => {
+  loadTestPrompt()
   loadModels()
   loadKeys()
   ensureBatchPolling()
@@ -156,6 +161,26 @@ onMounted(() => {
         <span class="probe-pill">实时进度 · 按分类汇总 · 可取消</span>
       </div>
       <div class="section-body">
+        <div class="form-row">
+          <div class="field" style="flex: 1 1 100%">
+            <label>
+              测试消息
+              <button class="btn btn-sm" type="button" style="margin-left: 8px" @click="resetTestPrompt">
+                ↺ 恢复默认
+              </button>
+            </label>
+            <input
+              v-model="testPrompt.message"
+              type="text"
+              :maxlength="testPrompt.maxLen"
+              placeholder="留空则使用默认提示词"
+            />
+            <div class="hint" style="margin-top: 6px">
+              单模型测试与批量测试都用这条消息；默认：<code>{{ testPrompt.defaultMessage }}</code>
+            </div>
+          </div>
+        </div>
+
         <div class="form-row">
           <div class="field">
             <label>测试使用 Key（可选）</label>

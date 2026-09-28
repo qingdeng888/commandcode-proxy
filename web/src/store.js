@@ -297,6 +297,52 @@ export function resetBatchState() {
   batch.error = ''
 }
 
+/* ---------------- 测试消息（跨视图共享） ----------------
+ * 「上游连通性测试 / 模型测试 / Key 测试」发的是同一条提示词。
+ * 默认值只在后端定义一处（GET /config 的 defaultTestMessage），这里取回来预填；
+ * 放在 store 里共享，切换页面时用户填过的内容不会丢。
+ */
+export const testPrompt = reactive({
+  message: '',
+  defaultMessage: '你是谁，出来干活了',
+  maxLen: 4000,
+  loaded: false,
+  promise: null,
+})
+
+/** 拉取后端默认值并预填（用户已改过内容则不覆盖）。取不到就用内置兜底值，不阻塞页面。 */
+export function loadTestPrompt() {
+  if (testPrompt.promise) return testPrompt.promise
+  testPrompt.promise = (async () => {
+    try {
+      const { data } = await api('GET', '/config')
+      if (data && data.defaultTestMessage) {
+        const untouched = !testPrompt.message || testPrompt.message === testPrompt.defaultMessage
+        testPrompt.defaultMessage = data.defaultTestMessage
+        testPrompt.maxLen = data.maxTestMessageLen || testPrompt.maxLen
+        if (untouched) testPrompt.message = data.defaultTestMessage
+      }
+      testPrompt.loaded = true
+    } catch {
+      if (!testPrompt.message) testPrompt.message = testPrompt.defaultMessage
+    } finally {
+      testPrompt.promise = null
+    }
+  })()
+  return testPrompt.promise
+}
+
+/** 拼进请求体：留空就不传，交给后端套用默认值（后端才是默认值的唯一真源） */
+export function testMessagePayload() {
+  const v = (testPrompt.message || '').trim()
+  return v ? { message: v } : {}
+}
+
+/** 恢复为后端默认提示词 */
+export function resetTestPrompt() {
+  testPrompt.message = testPrompt.defaultMessage
+}
+
 /** 便捷聚合导出，模板里可直接用 store.xxx。 */
 export const store = {
   now,
@@ -305,6 +351,7 @@ export const store = {
   models,
   keysState,
   batch,
+  testPrompt,
   loadSession,
   login,
   logout,
@@ -319,4 +366,7 @@ export const store = {
   ensureBatchPolling,
   stopBatchPolling,
   resetBatchState,
+  loadTestPrompt,
+  testMessagePayload,
+  resetTestPrompt,
 }

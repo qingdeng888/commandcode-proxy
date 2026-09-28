@@ -465,6 +465,27 @@ const catalog = createModelCatalog({
 // —— 实测 /provider/v1/usage、/provider/v1/balance、/api/v1/users/me 全部 404。
 // 因此改为就地判定：能不能跑通、因为什么跑不通，由上游错误码直接回答。
 
+// 探测提示词：默认值与参考项目 Cline-proxy 保持一致，后台可自定义（见 /admin/ 的上游连通性测试）。
+// 默认值只在后端定义一处，前端通过 GET /admin/api/config 的 defaultTestMessage 取值预填 ——
+// 两边各写一遍迟早会不一致。
+const DEFAULT_TEST_MESSAGE = '你是谁，出来干活了';
+const MAX_TEST_MESSAGE_LEN = 4000;
+// 探测回复只用于展示「有没有正常出字」，不必读完；但太短会把正常回答截得像故障
+const PROBE_MAX_TOKENS = 256;
+const PROBE_PREVIEW_CHARS = 500;
+
+/** 归一化测试消息：空/非字符串 → 默认值；过长 → 报错（由调用方转成 400） */
+function normalizeTestMessage(message) {
+  if (message === undefined || message === null) return { ok: true, text: DEFAULT_TEST_MESSAGE };
+  if (typeof message !== 'string') return { ok: false, error: '测试消息必须是字符串' };
+  const text = message.trim();
+  if (!text) return { ok: true, text: DEFAULT_TEST_MESSAGE };
+  if (text.length > MAX_TEST_MESSAGE_LEN) {
+    return { ok: false, error: `测试消息过长（上限 ${MAX_TEST_MESSAGE_LEN} 字符）` };
+  }
+  return { ok: true, text };
+}
+
 /** 读探测响应流，取回一小段文本。限时 + 限字节，避免探测把连接挂死。 */
 async function consumeProbeStream(response, timeoutMs = 45000) {
   const reader = response.body.getReader();
@@ -497,7 +518,7 @@ async function consumeProbeStream(response, timeoutMs = 45000) {
       }
 
       // 已经有结论就不必把整个流读完
-      if (streamError || sawFinish || text.length > 200 || bytes > 512 * 1024) break;
+      if (streamError || sawFinish || text.length > PROBE_PREVIEW_CHARS || bytes > 512 * 1024) break;
     }
   } finally {
     try { await reader.cancel(); } catch {}
@@ -508,22 +529,29 @@ async function consumeProbeStream(response, timeoutMs = 45000) {
 
 /**
  * 对指定 Key + 模型做一次真实探测。
- * 返回 { model, ok, category, latencyMs, httpStatus, message, outputPreview }
+ * message 省略时用 DEFAULT_TEST_MESSAGE（与参考项目一致的「你是谁，出来干活了」）。
+ * 返回 { model, ok, category, latencyMs, httpStatus, message, outputPreview, prompt }
  */
-async function probeModel({ key, model }) {
+async function probeModel({ key, model, message }) {
   const started = Date.now();
   const elapsed = () => Date.now() - started;
+
+  const norm = normalizeTestMessage(message);
+  if (!norm.ok) {
+    return { model, ok: false, category: 'error', latencyMs: 0, httpStatus: null, message: norm.error };
+  }
+  const prompt = norm.text;
 
   let ccBody;
   try {
     ccBody = buildCcRequest({
       model,
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 16,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: PROBE_MAX_TOKENS,
       stream: true,
     });
   } catch (e) {
-    return { model, ok: false, category: 'error', latencyMs: elapsed(), httpStatus: null, message: `构造请求失败: ${e.message}` };
+    return { model, ok: false, category: 'error', latencyMs: elapsed(), httpStatus: null, message: `构造请求失败: ${e.message}`, prompt };
   }
 
   try {
@@ -540,6 +568,7 @@ async function probeModel({ key, model }) {
         latencyMs: elapsed(),
         httpStatus: response.status,
         message: summarizeUpstreamError(body, 200) || `HTTP ${response.status}`,
+        prompt,
       };
     }
 
@@ -551,6 +580,7 @@ async function probeModel({ key, model }) {
         model, ok: false, category: category === 'error' ? 'error' : category,
         latencyMs: elapsed(), httpStatus: 200,
         message: summarizeUpstreamError(String(streamError), 200),
+        prompt,
       };
     }
 
@@ -563,7 +593,8 @@ async function probeModel({ key, model }) {
       latencyMs: elapsed(),
       httpStatus: 200,
       message: ok ? '链路正常' : '上游返回 200 但没有任何输出',
-      outputPreview: summarizeUpstreamError(text, 200),
+      outputPreview: summarizeUpstreamError(text, PROBE_PREVIEW_CHARS),
+      prompt,
     };
   } catch (e) {
     const isTimeout = e?.name === 'TimeoutError' || e?.name === 'AbortError';
@@ -574,6 +605,7 @@ async function probeModel({ key, model }) {
       latencyMs: elapsed(),
       httpStatus: null,
       message: `${isTimeout ? '超时' : '连接失败'}: ${e.message}`,
+      prompt,
     };
   }
 }
@@ -581,7 +613,7 @@ async function probeModel({ key, model }) {
 // 批量模型测试任务（受限并发 + 可取消），进度由后台轮询
 const modelTestRunner = createModelTestRunner({
   log: (...args) => log(...args),
-  probe: async ({ model, keyId }) => {
+  probe: async ({ model, keyId, message }) => {
     let key = null;
     if (keyId) {
       const entry = keyPool.findById(keyId);
@@ -595,7 +627,7 @@ const modelTestRunner = createModelTestRunner({
     if (!key) {
       return { model, ok: false, category: 'error', latencyMs: null, httpStatus: null, message: '没有可用的 Key', keyId, checkedAt: new Date().toISOString() };
     }
-    const r = await probeModel({ key, model });
+    const r = await probeModel({ key, model, message });
     return { ...r, keyId: keyId || keyPool.idForKey(key), checkedAt: new Date().toISOString() };
   },
 });
@@ -3704,6 +3736,8 @@ const adminApi = createAdminApi({
   logBus,
   log: (...args) => log(...args),
   probe: probeModel,
+  // 测试消息的默认值与上限：由这里注入，后台只要读取即可（避免默认值写两份）
+  testMessage: { default: DEFAULT_TEST_MESSAGE, maxLen: MAX_TEST_MESSAGE_LEN },
   startedAt: SERVER_STARTED_AT,
   reloadUpstreamProxy: refreshUpstreamProxy,
   getInflight: () => inflightCount,

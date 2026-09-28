@@ -249,6 +249,24 @@ is not in your plan) / `network` / `error`.
 > all return 404 — CC exposes no balance or usage API. Hence the direct classification above:
 > whether it works, and why not, is answered by the upstream error code itself.
 
+#### Test message
+
+Connectivity tests, model tests and key tests all send the **same prompt**, defaulting to the
+reference project's value:
+
+```
+你是谁，出来干活了
+```
+
+- Editable in three places — Dashboard → connectivity test, Models, and Keys → rotation strategy —
+  and shared across all of them (it survives navigation), with a `↺ 恢复默认` reset button.
+- Left blank it falls back to the default; an empty prompt is never sent.
+- Max 4000 characters; a non-string or over-long value returns 400 with the reason.
+- Results echo the text that was **actually sent** (`prompt`), which is what you want when asking
+  "so what exactly went upstream?".
+- The default lives in exactly one place (the backend); the frontend prefills from
+  `GET /admin/api/config`'s `defaultTestMessage`. Duplicating it in two places would drift.
+
 ### Hot reload
 
 | Change | How it takes effect |

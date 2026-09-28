@@ -114,8 +114,15 @@ Key 列表项（下称 `KeyItem`）：
 | `/admin/api/keys/update` | POST | `{id,label?,enabled?}` |
 | `/admin/api/keys/delete` | POST | `{id}` |
 | `/admin/api/keys/reveal` | POST | `{id}` → `{success,data:{key:"user_..."}}` |
-| `/admin/api/keys/test` | POST | `{id}` 或 `{key}` → 真实最小请求探测 |
+| `/admin/api/keys/test` | POST | `{id}` 或 `{key}`，可选 `message` → 真实最小请求探测 |
 | `/admin/api/keys/import` | POST | 把 `config`/`env` 来源的 Key 导入为 `ui` 来源。传 `{id}` 只导入该条；不传 body 则导入全部 |
+
+**测试消息（`message`）**：`/keys/test`、`/models/test`、`/models/test-batch` 共用同一条提示词。
+
+- 省略、`null`、或纯空白 → 使用后端默认值 **`你是谁，出来干活了`**（与参考项目一致）。
+  默认值**只在后端定义一处**，前端通过 `GET /admin/api/config` 的 `defaultTestMessage` 取值预填。
+- 非字符串 → 400 `测试消息必须是字符串`；超过 4000 字符 → 400 `测试消息过长（上限 4000 字符）`。
+- 响应中的 `prompt` 回显**实际发送**的内容，便于确认「到底发出去的是什么」。
 
 新增/测试请求体校验：Key 必须是 `user_` 开头的非空字符串（含空格→400 `Key 格式不正确`）；重复 Key → 400 `该 Key 已存在`。
 
@@ -125,7 +132,8 @@ Key 列表项（下称 `KeyItem`）：
 { "success": true, "data": {
   "ok": true, "category": "ok", "latencyMs": 812,
   "message": "链路正常", "model": "deepseek/deepseek-v4-flash",
-  "httpStatus": 200, "keyId": "k_...", "checkedAt": "..." } }
+  "httpStatus": 200, "keyId": "k_...", "checkedAt": "...",
+  "prompt": "你是谁，出来干活了" } }
 ```
 
 `category` 枚举（同时用于 `health.status`）：
@@ -139,9 +147,7 @@ Key 列表项（下称 `KeyItem`）：
 | `network` | 连接失败 / 超时 |
 | `error` | 其它上游错误 |
 
-> 注意：`not_in_plan` 是**模型维度**的结论，不代表 Key 失效。前端在 Key 测试里遇到它应提示「Key 有效，但该模型不在套餐内」。
-
-## 模型
+> 注意：`not_in_plan` 是**模型维度**的结论，不代表 Key 失效。前端在 Key 测试里遇到它应提示「Key 有效，但该模型不在套餐内」。## 模型
 
 模型目录来自 Command Code 上游 `GET /provider/v1/models`（缓存，默认 5 分钟）。
 
@@ -170,8 +176,8 @@ Key 列表项（下称 `KeyItem`）：
 |---|---|---|
 | `/admin/api/models` | GET | 目录 |
 | `/admin/api/models/refresh` | POST | 立即重新拉取 |
-| `/admin/api/models/test` | POST | `{model,keyId?}` 单模型测试 |
-| `/admin/api/models/test-batch` | POST | `{models?:[id],keyId?,concurrency?}` 启动批量测试 → `{success,data:{jobId}}` |
+| `/admin/api/models/test` | POST | `{model,keyId?,message?}` 单模型测试 |
+| `/admin/api/models/test-batch` | POST | `{models?:[id],keyId?,message?,concurrency?}` 启动批量测试 → `{success,data:{jobId,total,prompt}}` |
 | `/admin/api/models/test-status` | GET | 批量进度与结果 |
 | `/admin/api/models/test-cancel` | POST | 取消批量测试 |
 
@@ -180,7 +186,9 @@ Key 列表项（下称 `KeyItem`）：
 ```json
 { "model": "claude-sonnet-5", "ok": true, "category": "ok",
   "latencyMs": 1200, "httpStatus": 200, "message": "链路正常",
-  "keyId": "k_...", "checkedAt": "...", "outputPreview": "hi" }
+  "keyId": "k_...", "checkedAt": "...",
+  "prompt": "你是谁，出来干活了",
+  "outputPreview": "我是你的 AI 助手，随叫随到。…" }
 ```
 
 批量状态 `data`：
@@ -232,9 +240,14 @@ Key 列表项（下称 `KeyItem`）：
   "settingsPath": "/app/data/settings.json",
   "version": "1.1.0",
   "envLocked": ["logLevel"],
-  "settingSources": { "strategy": "settings", "logLevel": "env", "port": "config" }
+  "settingSources": { "strategy": "settings", "logLevel": "env", "port": "config" },
+  "defaultTestMessage": "你是谁，出来干活了",
+  "maxTestMessageLen": 4000
 } }
 ```
+
+- `defaultTestMessage` / `maxTestMessageLen`：探测用提示词的默认值与长度上限。
+  前端**必须**用它预填「测试消息」输入框 —— 默认值只在后端定义一处，两边各写一遍迟早会不一致。
 
 - `settingSources`：每个字段的值当前取自哪一层 —— `default` | `config`（`config.json`）|
   `settings`（后台写入的 `data/settings.json`）| `env`（环境变量）。后台可据此标注来源。
