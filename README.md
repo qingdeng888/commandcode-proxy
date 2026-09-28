@@ -249,6 +249,35 @@ is not in your plan) / `network` / `error`.
 > all return 404 — CC exposes no balance or usage API. Hence the direct classification above:
 > whether it works, and why not, is answered by the upstream error code itself.
 
+#### Model management
+
+The Models page has a **🔄 同步上游模型** (sync upstream models) button that refetches the catalog
+and reports what changed (`共 82 个模型，新增 2，移除 1`). It also auto-syncs every 5 minutes.
+
+**Enable / disable** works at three granularities: a per-row toggle, multi-select
+(**✅ 启用所选** / **🚫 禁用所选**), and a header select-all checkbox (with indeterminate state)
+for the same two batch actions.
+
+**Disabling is real** — it takes effect in two places, otherwise the flag would be decorative:
+
+| Where | Behaviour |
+|-------|-----------|
+| `GET /v1/models` | Disabled models are **no longer returned**; clients cannot discover them |
+| Explicit request | `/v1/chat/completions`, `/v1/messages`, `/v1/responses` all return **400** saying the model is disabled |
+| Models absent from the catalog | **Still passed through** — the catalog can be stale, and "not listed" must not block requests that would otherwise work |
+
+State lives in `data/models.json` as a **sparse disabled set** (only disabled ids are recorded):
+
+- New upstream models are **enabled** by default — no per-model record needed;
+- An upstream hiccup that drops models from the response cannot wipe your enable list;
+- If upstream later re-adds a previously disabled model, it stays disabled (deliberate — no silent revival).
+
+Disabling the current default model warns you and falls back to the first enabled model; batch tests
+also default to **enabled models only** when no explicit list is given.
+
+> Disabled ids no longer present upstream are reported as a count (`staleDisabled`) but never
+> auto-pruned — auto-pruning would turn a transient upstream blip into "your settings got wiped".
+
 #### Test message
 
 Connectivity tests, model tests and key tests all send the **same prompt**, defaulting to the

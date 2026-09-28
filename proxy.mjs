@@ -23,6 +23,7 @@ import { createLogBus, levelEnabled } from './lib/logbus.mjs';
 import { createKeyPool } from './lib/keys.mjs';
 import { createAdminAuth } from './lib/admin-auth.mjs';
 import { createModelCatalog, createModelTestRunner, classifyProbe } from './lib/models.mjs';
+import { createModelState } from './lib/model-state.mjs';
 import { createAdminApi } from './lib/admin-api.mjs';
 
 const SERVER_STARTED_AT = Date.now();
@@ -456,6 +457,21 @@ const catalog = createModelCatalog({
     headers: { ...(options?.headers || {}), 'x-command-code-version': CC_VERSION },
   }),
 });
+
+// 模型的启用/禁用状态（后台可批量改，落盘 data/models.json）。
+// 不只影响后台列表：禁用后 /v1/models 不再返回它，直接指名调用也会被拒 —— 否则就只是摆设。
+const modelState = createModelState({ log: (...args) => log(...args) });
+
+/**
+ * 是否允许使用该模型。只拦「明确被禁用」的模型；
+ * 目录里没有的模型仍照旧透传（目录可能过期，不能因此把能用的请求拦掉）。
+ * 返回 null 表示放行，否则返回给下游的错误说明。
+ */
+function disabledModelError(requestedModel) {
+  if (!requestedModel) return null;
+  if (modelState.isEnabled(requestedModel)) return null;
+  return `模型 ${requestedModel} 已在后台被禁用（可在 /admin/ 的「模型」页重新启用）`;
+}
 
 // ── 探测（Key 测试 / 模型测试）────────────────────────
 // 「模型测试」= 用指定 Key 对指定模型发一次真实最小请求，按上游返回的错误码归类。
@@ -1678,6 +1694,13 @@ async function handleChatCompletions(req, res) {
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
+  // 明确被禁用的模型直接拒掉：只在 /v1/models 里隐藏它是不够的 ——
+  // 客户端缓存了模型名照样能调，禁用就成了摆设
+  const disabledErr = disabledModelError(openaiReq.model);
+  if (disabledErr) {
+    sendJSON(res, 400, { error: { message: disabledErr, type: 'invalid_request_error' } });
+    return;
+  }
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
 
@@ -2623,6 +2646,11 @@ async function handleMessages(req, res) {
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
+  const disabledErr = disabledModelError(anthropicReq.model);
+  if (disabledErr) {
+    sendAnthropicError(res, 400, 'invalid_request_error', disabledErr);
+    return;
+  }
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
@@ -3425,6 +3453,11 @@ async function handleResponses(req, res) {
 
   const stream = chatReq.stream === true;
   const model = chatReq.model || 'deepseek/deepseek-v4-flash';
+  const disabledErr = disabledModelError(chatReq.model);
+  if (disabledErr) {
+    sendResponsesError(res, 400, 'invalid_request_error', disabledErr);
+    return;
+  }
   const responseId = newResponsesId('resp_');
   const created = nowUnix();
   const echoOpts = {
@@ -3710,9 +3743,11 @@ async function handleModels(req, res) {
   const keyForCatalog = auth.upstreamKey || keyPool.pick()?.key || null;
   const models = await fetchModels(keyForCatalog);
   const now = nowUnix();
+  // 被禁用的模型不出现在这里：下游客户端就发现不到它，自然不会去用
+  const visible = modelState.filterEnabled(models);
   sendJSON(res, 200, {
     object: 'list',
-    data: models.map(m => ({
+    data: visible.map(m => ({
       id: m.id,
       object: 'model',
       created: now,
@@ -3732,6 +3767,7 @@ const adminApi = createAdminApi({
   auth: adminAuth,
   pool: keyPool,
   catalog,
+  modelState,
   runner: modelTestRunner,
   logBus,
   log: (...args) => log(...args),

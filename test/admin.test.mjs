@@ -582,6 +582,172 @@ test('设置接口可热改策略与默认模型，非法值被拒', async () =>
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
+// ── ⑩b 模型启用/禁用 ────────────────────────────────
+
+test('模型启用/禁用：列表带状态、单条与批量切换、全选、参数校验', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const first = (await (await api.get('/models')).json()).data;
+    assert.equal(first.models.length, 2);
+    assert.ok(first.models.every(m => m.enabled === true), '默认应全部启用');
+    assert.deepEqual(first.counts, { total: 2, enabled: 2, disabled: 0 });
+
+    const [m1, m2] = first.models.map(m => m.id);
+
+    // 单条禁用
+    const dis = await api.post('/models/disable', { ids: [m1] });
+    assert.equal(dis.status, 200);
+    const disBody = await dis.json();
+    assert.deepEqual(disBody.data.changed, [m1]);
+    assert.deepEqual(disBody.data.counts, { total: 2, enabled: 1, disabled: 1 });
+
+    const after = (await (await api.get('/models')).json()).data;
+    assert.equal(after.models.find(m => m.id === m1).enabled, false);
+    assert.equal(after.models.find(m => m.id === m2).enabled, true);
+
+    // 重复禁用 → changed 为空，而不是报错
+    const again = await api.post('/models/disable', { ids: [m1] });
+    assert.deepEqual((await again.json()).data.changed, []);
+
+    // 批量：全选禁用
+    const all = await api.post('/models/disable', { all: true });
+    assert.equal(all.status, 200);
+    assert.deepEqual((await all.json()).data.counts, { total: 2, enabled: 0, disabled: 2 });
+
+    // 全选启用
+    const allOn = await api.post('/models/enable', { all: true });
+    assert.deepEqual((await allOn.json()).data.counts, { total: 2, enabled: 2, disabled: 0 });
+
+    // 参数校验
+    assert.equal((await api.post('/models/disable', {})).status, 400, '既没 ids 也没 all 应报错');
+    assert.equal((await api.post('/models/disable', { ids: [] })).status, 400);
+    const unknown = await api.post('/models/disable', { ids: ['no/such-model'] });
+    assert.equal(unknown.status, 400);
+    assert.match((await unknown.json()).error, /不在目录中/);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('禁用模型对数据面真的生效：/v1/models 不返回，指名调用被 400 拒绝', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  const H = { Authorization: `Bearer ${CATALOG_KEY}` };
+  const CHAT = (model) => ({ model, messages: [{ role: 'user', content: 'hi' }] });
+  try {
+    const api = await authed(proxy);
+    const first = (await (await api.get('/models')).json()).data;
+    const [m1, m2] = first.models.map(m => m.id);
+
+    // 先用一下，确认正常情况下数据面是通的
+    const before = await proxy.post('/v1/chat/completions', CHAT(m1), H);
+    assert.equal(before.status, 200, '正常情况下应能调用');
+
+    // 禁用它
+    await api.post('/models/disable', { ids: [m1] });
+
+    // /v1/models 不再返回它
+    const listed = await (await proxy.get('/v1/models')).json();
+    const ids = listed.data.map(m => m.id);
+    assert.ok(!ids.includes(m1), '被禁用的模型不应出现在 /v1/models');
+    assert.ok(ids.includes(m2), '未禁用的模型应照常出现');
+
+    // 直接指名调用 → 400 且说明原因（只在列表里隐藏是不够的）
+    const blocked = await proxy.post('/v1/chat/completions', CHAT(m1), H);
+    assert.equal(blocked.status, 400);
+    const errBody = await blocked.json();
+    assert.match(errBody.error.message, /被禁用/);
+    assert.equal(errBody.error.type, 'invalid_request_error');
+    assert.equal(upstream.generateCount(), 1, '被拒绝的请求不应打到上游');
+
+    // Anthropic 与 Responses 两条路径同样拦截
+    const anthropicBlocked = await proxy.post('/v1/messages', { model: m1, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }, { 'x-api-key': CATALOG_KEY });
+    assert.equal(anthropicBlocked.status, 400);
+    const responsesBlocked = await proxy.post('/v1/responses', { model: m1, input: 'hi' }, H);
+    assert.equal(responsesBlocked.status, 400);
+
+    // 重新启用 → 恢复
+    await api.post('/models/enable', { ids: [m1] });
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT(m1), H)).status, 200);
+    const relisted = await (await proxy.get('/v1/models')).json();
+    assert.ok(relisted.data.map(m => m.id).includes(m1), '重新启用后应回到列表');
+
+    // 未在目录中的模型仍照旧透传（目录可能过期，不能因此拦下来）
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT('some/unlisted-model'), H)).status, 200);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('模型启用状态持久化：重启后仍然有效', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-mstate-'));
+  seedConfig(workdir);
+  const upstream = await startCatalogUpstream();
+  const env = { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' };
+
+  const proxy1 = await startProxy({ upstreamPort: upstream.port, env, cwd: workdir });
+  let disabledId;
+  try {
+    const api = await authed(proxy1);
+    const first = (await (await api.get('/models')).json()).data;
+    disabledId = first.models[0].id;
+    await api.post('/models/disable', { ids: [disabledId] });
+  } finally { await proxy1.kill(); }
+
+  assert.ok(existsSync(join(workdir, 'data', 'models.json')), '禁用状态应落盘 data/models.json');
+
+  const proxy2 = await startProxy({ upstreamPort: upstream.port, env, cwd: workdir });
+  try {
+    const api = await authed(proxy2);
+    const after = (await (await api.get('/models')).json()).data;
+    assert.equal(after.models.find(m => m.id === disabledId).enabled, false, '重启后仍应保持禁用');
+    assert.equal(after.counts.disabled, 1);
+
+    // 数据面同样生效
+    const blocked = await proxy2.post('/v1/chat/completions',
+      { model: disabledId, messages: [{ role: 'user', content: 'hi' }] },
+      { Authorization: `Bearer ${CATALOG_KEY}` });
+    assert.equal(blocked.status, 400);
+  } finally {
+    await proxy2.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('同步上游模型会报告新增与移除', async () => {
+  const models = [
+    { id: 'model-a', name: 'A', context_length: 1000, supported_endpoints: ['/chat/completions'] },
+    { id: 'model-b', name: 'B', context_length: 2000, supported_endpoints: ['/chat/completions'] },
+  ];
+  const upstream = await startCatalogUpstream({ models });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');
+
+    // 上游目录变化：去掉 A，加入 C
+    models.splice(0, 1);
+    models.push({ id: 'model-c', name: 'C', context_length: 3000, supported_endpoints: ['/chat/completions'] });
+
+    const res = await api.post('/models/refresh', {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.data.added, ['model-c']);
+    assert.deepEqual(body.data.removed, ['model-a']);
+    assert.equal(body.data.count, 2);
+    assert.match(body.message, /新增 1/);
+    assert.match(body.message, /移除 1/);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
 // ── ⑪ 配置持久化（Docker 单文件挂载下最容易坏的一环）──────────
 //
 // 背景：Docker 里 config.json 是**单文件 bind mount**，而原子写是「临时文件 + rename」。

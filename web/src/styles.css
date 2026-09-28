@@ -268,3 +268,9 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
   .toast-wrap{left:12px;right:12px;align-items:stretch}
   .toast{max-width:none}
 }
+
+/* 模型多选：选择列与禁用行 */
+.col-check{width:36px;text-align:center;padding-left:6px!important;padding-right:6px!important}
+.col-check input[type=checkbox]{cursor:pointer;width:15px;height:15px;accent-color:var(--accent);vertical-align:middle}
+tr.row-disabled td{opacity:.55}
+tr.row-disabled td.col-check,tr.row-disabled td:last-child{opacity:1}

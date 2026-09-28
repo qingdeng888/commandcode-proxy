@@ -156,8 +156,10 @@ Key 列表项（下称 `KeyItem`）：
   "models": [
     { "id": "claude-sonnet-5", "name": "Claude Sonnet 5",
       "contextLength": 1000000, "supportedEndpoints": ["/messages"],
-      "source": "upstream" }
+      "source": "upstream", "enabled": true }
   ],
+  "counts": { "total": 82, "enabled": 80, "disabled": 2 },
+  "staleDisabled": ["old-model-id"],
   "lastSyncAt": "2026-09-28T06:00:00.000Z",
   "nextSyncInSec": 240,
   "syncing": false,
@@ -167,6 +169,13 @@ Key 列表项（下称 `KeyItem`）：
 } }
 ```
 
+- `enabled`：该模型当前是否可用。**默认启用**：禁用状态存成稀疏集合（只记被禁用的 id），
+  所以上游新增的模型默认就是可用的，不需要为每个新模型补记录。
+- `counts`：`{total, enabled, disabled}`，供列表页显示。
+- `staleDisabled`：禁用记录里那些**已不在上游目录**的 id（仅提示，不自动清理 ——
+  上游若重新提供该模型，禁用状态仍然生效）。
+- `defaultModel`：若配置的默认模型被禁用或不在目录里，会自动退到**第一个启用**的模型。
+
 - `fromUpstream`：`false` 表示当前列表是**静态回退**（没有可用 Key、或上游拉取失败），
   `source` 会是 `"static"`；`true` 表示来自上游真实目录。后台应据此明确提示用户。
 - `lastError`：上次同步失败的原因；`null` 表示上次成功。
@@ -175,9 +184,26 @@ Key 列表项（下称 `KeyItem`）：
 | 接口 | 方法 | 说明 |
 |---|---|---|
 | `/admin/api/models` | GET | 目录 |
-| `/admin/api/models/refresh` | POST | 立即重新拉取 |
+| `/admin/api/models/refresh` | POST | 立即重新拉取（同步上游模型），返回 `{count, added, removed, counts, fromUpstream}` |
+| `/admin/api/models/enable` | POST | `{ids:[id]}` 或 `{all:true}` 启用 |
+| `/admin/api/models/disable` | POST | `{ids:[id]}` 或 `{all:true}` 禁用 |
 | `/admin/api/models/test` | POST | `{model,keyId?,message?}` 单模型测试 |
-| `/admin/api/models/test-batch` | POST | `{models?:[id],keyId?,message?,concurrency?}` 启动批量测试 → `{success,data:{jobId,total,prompt}}` |
+| `/admin/api/models/test-batch` | POST | `{models?:[id],keyId?,message?,concurrency?}` 启动批量测试 → `{success,data:{jobId,total,prompt}}`。未指定 `models` 时**只测启用的模型** |
+
+**启用/禁用语义**（两处都生效，否则禁用就只是摆设）：
+
+| 位置 | 行为 |
+|------|------|
+| `GET /v1/models`（数据面）| 被禁用的模型**不再返回** |
+| `POST /v1/chat/completions` / `/v1/messages` / `/v1/responses` | 指名调用被禁用的模型 → **400** `模型 X 已在后台被禁用…` |
+| 目录里没有的模型 | **照旧透传**（目录可能过期，不能因此把本来能用的请求拦下来） |
+
+响应的 `data`：`{changed, requested, counts, defaultModel}`。`message` 会说明实际改了几个；
+若禁用的正是当前默认模型，会另外提示「默认模型已禁用，将自动改用 X」。
+
+校验：`ids` 与 `all` 都没有 → 400 `需要提供 ids 数组或 all: true`；`ids` 为空数组 → 400；
+全部 id 都不在目录中 → 400 `指定的模型都不在目录中`（只接受目录里存在的 id，
+避免前端拼错在禁用集合里留下垃圾）。重复禁用/启用不报错，`changed` 为空。
 | `/admin/api/models/test-status` | GET | 批量进度与结果 |
 | `/admin/api/models/test-cancel` | POST | 取消批量测试 |
 

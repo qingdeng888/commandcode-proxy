@@ -103,6 +103,8 @@ export function loadStats(force = false) {
 /* ---------------- 模型目录 ---------------- */
 export const models = reactive({
   list: [],
+  counts: null,
+  staleDisabled: [],
   lastSyncAt: null,
   nextSyncInSec: 0,
   syncing: false,
@@ -119,6 +121,8 @@ export function loadModels(force = false) {
     try {
       const { data } = await api('GET', '/models')
       models.list = (data && data.models) || []
+      models.counts = (data && data.counts) || null
+      models.staleDisabled = (data && data.staleDisabled) || []
       models.lastSyncAt = (data && data.lastSyncAt) || null
       models.nextSyncInSec = (data && data.nextSyncInSec) || 0
       models.syncing = !!(data && data.syncing)

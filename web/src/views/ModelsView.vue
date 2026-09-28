@@ -36,6 +36,69 @@ const testKeyId = ref('')
 const concurrency = ref(4)
 const showAllResults = ref(false)
 
+/* ---- 模型多选与启用/禁用 ---- */
+const selectedIds = ref([])
+const savingSelection = ref(false)
+const togglingId = ref('')
+
+const selectedCount = computed(() => selectedIds.value.length)
+const allSelected = computed(() => list.value.length > 0 && selectedIds.value.length === list.value.length)
+const someSelected = computed(() => selectedIds.value.length > 0 && !allSelected.value)
+const enabledCount = computed(() => list.value.filter((m) => m.enabled !== false).length)
+const disabledCount = computed(() => list.value.length - enabledCount.value)
+
+function isSelected(id) {
+  return selectedIds.value.includes(id)
+}
+
+function toggleSelect(id, checked) {
+  const set = new Set(selectedIds.value)
+  if (checked) set.add(id)
+  else set.delete(id)
+  selectedIds.value = [...set]
+}
+
+function toggleSelectAll(checked) {
+  selectedIds.value = checked ? list.value.map((m) => m.id) : []
+}
+
+function clearSelection() {
+  selectedIds.value = []
+}
+
+/** 批量启用/禁用所选模型（数据面会立即生效：/v1/models 不再返回，直接调用也会被拒） */
+async function setEnabledForSelection(enabled) {
+  const ids = [...selectedIds.value]
+  if (!ids.length) return
+  const label = enabled ? '启用' : '禁用'
+  if (!window.confirm(`确定${label}所选 ${ids.length} 个模型吗？\n${enabled ? '启用后可被下游发现与调用。' : '禁用后不再出现在 /v1/models，被指名调用也会被拒绝。'}`)) return
+  savingSelection.value = true
+  try {
+    const res = await api('POST', enabled ? '/models/enable' : '/models/disable', { ids })
+    await loadModels(true)
+    clearSelection()
+    toast.success(res.message || `已${label} ${ids.length} 个模型`)
+  } catch (e) {
+    toast.error(`${label}失败：` + e.message)
+  } finally {
+    savingSelection.value = false
+  }
+}
+
+/** 单行切换 */
+async function toggleOneModel(m, enabled) {
+  togglingId.value = m.id
+  try {
+    const res = await api('POST', enabled ? '/models/enable' : '/models/disable', { ids: [m.id] })
+    await loadModels(true)
+    toast.success(res.message || `${m.id} 已${enabled ? '启用' : '禁用'}`)
+  } catch (e) {
+    toast.error('操作失败：' + e.message)
+  } finally {
+    togglingId.value = ''
+  }
+}
+
 const list = computed(() => models.list || [])
 const keyOptions = computed(() => keysState.list || [])
 
@@ -65,8 +128,9 @@ function sourceLabel(src) {
 async function doRefresh() {
   refreshing.value = true
   try {
-    await refreshModels()
-    toast.success(`模型清单已刷新：共 ${list.value.length} 个模型`)
+    const res = await refreshModels()
+    clearSelection()
+    toast.success(res.message || `已同步：共 ${list.value.length} 个模型`)
   } catch (e) {
     toast.error('刷新模型失败：' + e.message)
   } finally {
@@ -140,13 +204,14 @@ onMounted(() => {
     <h2>
       🧠 模型
       <span class="probe-pill">
-        共 {{ fmtNum(list.length) }} 个 · 上次同步 {{ fmtDateTime(models.lastSyncAt) }}
+        共 {{ fmtNum(list.length) }} 个 · 启用 {{ fmtNum(enabledCount) }} · 禁用 {{ fmtNum(disabledCount) }}
+        · 上次同步 {{ fmtDateTime(models.lastSyncAt) }}
         <template v-if="models.syncing"> · 同步中…</template>
         <template v-else-if="models.nextSyncInSec"> · {{ fmtNum(models.nextSyncInSec) }}s 后自动同步</template>
       </span>
       <button class="btn btn-sm" style="margin-left: auto" type="button" :disabled="refreshing" @click="doRefresh">
         <span v-if="refreshing" class="loading"></span>
-        {{ refreshing ? '刷新中…' : '🔄 刷新模型' }}
+        {{ refreshing ? '同步中…' : '🔄 同步上游模型' }}
       </button>
     </h2>
 
@@ -283,11 +348,51 @@ onMounted(() => {
         🧠 模型目录
         <span class="probe-pill">来自上游 /provider/v1/models（缓存）</span>
       </div>
+      <div class="section-body" style="padding-bottom: 0">
+        <div class="form-row" style="align-items: center; gap: 10px">
+          <span class="probe-pill">
+            已选 {{ fmtNum(selectedCount) }} / {{ fmtNum(list.length) }}
+          </span>
+          <div style="margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap">
+            <button
+              class="btn btn-sm btn-success"
+              type="button"
+              :disabled="!selectedCount || savingSelection"
+              @click="setEnabledForSelection(true)"
+            >✅ 启用所选</button>
+            <button
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="!selectedCount || savingSelection"
+              @click="setEnabledForSelection(false)"
+            >🚫 禁用所选</button>
+            <button class="btn btn-sm" type="button" :disabled="!selectedCount" @click="clearSelection">
+              清除选择
+            </button>
+          </div>
+        </div>
+        <div v-if="models && models.staleDisabled && models.staleDisabled.length" class="hint">
+          有 {{ models.staleDisabled.length }} 条禁用记录对应的模型已不在上游目录中（不影响使用）。
+        </div>
+        <div class="hint">
+          <strong>禁用</strong>后该模型不再出现在 <code>/v1/models</code>，被指名调用时也会返回 400 —— 否则禁用就只是个摆设。
+        </div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
+              <th class="col-check">
+                <input
+                  type="checkbox"
+                  :checked="allSelected"
+                  :indeterminate="someSelected"
+                  title="全选 / 取消全选"
+                  @change="toggleSelectAll($event.target.checked)"
+                />
+              </th>
               <th>模型 ID</th>
+              <th>状态</th>
               <th>名称</th>
               <th>上下文</th>
               <th>支持端点</th>
@@ -298,10 +403,31 @@ onMounted(() => {
           </thead>
           <tbody>
             <tr v-if="!list.length">
-              <td colspan="7" class="empty">{{ models.loading ? '加载中…' : '暂无模型，请点击「刷新模型」' }}</td>
+              <td colspan="9" class="empty">{{ models.loading ? '加载中…' : '暂无模型，请点击「同步上游模型」' }}</td>
             </tr>
-            <tr v-for="m in list" :key="m.id">
+            <tr v-for="m in list" :key="m.id" :class="{ 'row-disabled': m.enabled === false }">
+              <td class="col-check">
+                <input
+                  type="checkbox"
+                  :checked="isSelected(m.id)"
+                  @change="toggleSelect(m.id, $event.target.checked)"
+                />
+              </td>
               <td class="mono">{{ m.id }}</td>
+              <td>
+                <button
+                  class="btn btn-sm"
+                  type="button"
+                  :disabled="togglingId === m.id"
+                  :title="m.enabled === false ? '点击启用该模型' : '点击禁用该模型'"
+                  @click="toggleOneModel(m, m.enabled === false)"
+                >
+                  <span v-if="togglingId === m.id" class="loading"></span>
+                  <span v-else :class="m.enabled === false ? 'badge muted' : 'badge ok'">
+                    {{ m.enabled === false ? '已禁用' : '已启用' }}
+                  </span>
+                </button>
+              </td>
               <td>{{ m.name || '-' }}</td>
               <td class="mono">{{ fmtContext(m.contextLength) }}</td>
               <td>
