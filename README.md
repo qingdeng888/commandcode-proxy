@@ -958,14 +958,19 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 
 ### Pull from GHCR
 
-Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry by GitHub Actions on every push to `master` / `main` / `release` and on every `v*` tag:
+Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry by GitHub Actions on every push to `v2` / `master` / `main` / `release` and on every `v*` tag.
+
+> 📌 **This document lives on the `v2` branch, hence the `:v2` tag below.** The repository is
+> maintained as separate version lines: `:latest` follows `master` / `main` / `release` (the legacy
+> line) — do not use `:latest` on v2, it would pull the old build. `docker-compose.yml` points at
+> `:v2` by default too.
 
 ```bash
 cp config.json.example config.json
-docker pull ghcr.io/qingdeng888/commandcode-proxy:latest
+docker pull ghcr.io/qingdeng888/commandcode-proxy:v2
 docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
   -v "$PWD/config.json:/app/config.json:ro" \
-  ghcr.io/qingdeng888/commandcode-proxy:latest
+  ghcr.io/qingdeng888/commandcode-proxy:v2
 ```
 
 Image tags:

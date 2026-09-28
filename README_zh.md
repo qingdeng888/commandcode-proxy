@@ -978,14 +978,18 @@ CLI 发送图片的格式：
 
 ### 从 GHCR 拉取
 
-推送到 `master` / `main` / `release` 分支或打 `v*` tag 时，GitHub Actions 会构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
+推送到 `v2` / `master` / `main` / `release` 分支或打 `v*` tag 时，GitHub Actions 会构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry。
+
+> 📌 **本文档在 `v2` 分支上，所以下面用的是 `:v2` 标签。** 本仓库分版本维护，
+> `:latest` 跟随 `master` / `main` / `release`（legacy 线）—— 别在 v2 上用 `:latest`，
+> 那会拉到旧版。`docker-compose.yml` 也已默认指向 `:v2`。
 
 ```bash
 cp config.json.example config.json
-docker pull ghcr.io/qingdeng888/commandcode-proxy:latest
+docker pull ghcr.io/qingdeng888/commandcode-proxy:v2
 docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
   -v "$PWD/config.json:/app/config.json:ro" \
-  ghcr.io/qingdeng888/commandcode-proxy:latest
+  ghcr.io/qingdeng888/commandcode-proxy:v2
 ```
 
 镜像标签：

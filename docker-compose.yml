@@ -2,7 +2,11 @@ services:
   proxy:
     # 默认使用 GitHub Actions 预构建的多架构镜像（linux/amd64 + linux/arm64）。
     # 需要基于当前源码本地构建时，改用：docker compose -f docker-compose.local.yml up -d --build
-    image: ghcr.io/qingdeng888/commandcode-proxy:latest
+    #
+    # 用 :v2 而不是 :latest：本项目分版本维护，:latest 跟随 master / main / release
+    # （legacy 线）。这里是 v2 分支，跟着它走的用户必须拿到 v2 的镜像，
+    # 否则「检出 v2 + compose up」会静默拉起旧版。
+    image: ghcr.io/qingdeng888/commandcode-proxy:v2
     ports:
       # 宿主端口 → 容器内固定 3050，可用 PROXY_PORT 自定义宿主侧
       - "${PROXY_PORT:-3050}:3050"
