@@ -854,6 +854,72 @@ test('设置接口可热改策略与默认模型，非法值被拒', async () =>
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
+// ── ⑩ 用量统计（token 记账）──────────────────────────
+
+test('数据面请求计入 token 用量，且一条请求只记一次（流式/非流式都不重复）', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  const H = { Authorization: `Bearer ${CATALOG_KEY}` };
+  const CHAT = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] };
+  try {
+    const api = await authed(proxy);
+    const keyId = (await (await api.get('/usage')).json()).data.items[0].keyId;
+
+    // 非流式一次
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, H)).status, 200);
+    let row = (await (await api.get('/usage')).json()).data.items.find(i => i.keyId === keyId);
+    assert.equal(row.requestsToday, 1, '一条请求只应记 1 次（重复记账是最容易犯的错）');
+    assert.equal(row.tokensInToday, 3, '应记下输入 token（mock 的 totalUsage.inputTokens）');
+    assert.equal(row.tokensOutToday, 1, '应记下输出 token');
+
+    // 流式一次 → 累加，同样只记一次
+    const sres = await proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, H);
+    await sres.text();
+    await new Promise(r => setTimeout(r, 300));   // 等 response 的 finish 钩子跑完
+    row = (await (await api.get('/usage')).json()).data.items.find(i => i.keyId === keyId);
+    assert.equal(row.requestsToday, 2, '流式请求也应恰好记 1 次');
+    assert.equal(row.tokensInToday, 6, '两条请求的 token 应累加');
+    assert.equal(row.tokensOutToday, 2);
+
+    // 汇总口径与明细一致
+    const sum = (await (await api.get('/usage')).json()).data.summary;
+    assert.equal(sum.requestsToday, 2);
+    assert.equal(sum.inToday, 6);
+    assert.equal(sum.outToday, 2);
+
+    // 仪表盘的 stats 也要能读到（否则卡片显示 0）
+    const stats = (await (await api.get('/stats')).json()).data;
+    assert.equal(stats.tokens.inToday, 6, 'stats 的 token 统计应与用量页一致');
+    assert.equal(stats.tokens.outToday, 2);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('后台的模型测试也计入该 Key 的用量（否则只点测试的用量永远显示 0）', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    const keyId = (await (await api.get('/usage')).json()).data.items[0].keyId;
+
+    const before = (await (await api.get('/usage')).json()).data.items.find(i => i.keyId === keyId);
+    assert.equal(before.requestsToday, 0, '探测之前应为 0');
+
+    await api.post('/models/test', { model: list.models[0].id });
+    const after = (await (await api.get('/usage')).json()).data.items.find(i => i.keyId === keyId);
+    assert.equal(after.requestsToday, 1, '模型测试应计入请求数');
+    assert.equal(after.tokensInToday, 3, '模型测试应计入 token');
+    assert.equal(after.tokensOutToday, 1);
+    assert.ok(after.lastUsedAt, '应更新最后使用时间');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
 // ── ⑩a 2API Key（下游客户端凭证）与上游 Key 的边界 ──────
 
 test('2API Key：签发后保护立即生效，且与上游 Key 各自独立', async () => {

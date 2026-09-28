@@ -611,6 +611,22 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
  * 返回 { model, ok, category, latencyMs, httpStatus, message, outputPreview, prompt }
  */
 async function probeModel({ key, model, message, mode = 'single' }) {
+  const result = await probeModelInner({ key, model, message, mode });
+  // 探测的用量同样记账（含失败：失败也要算进请求数与失败数）
+  try {
+    keyPool.recordRequest(key, { ok: result.category === 'ok' });
+    const u = result.usage;
+    if (u) {
+      keyPool.recordTokens(key, {
+        tokensIn: Number(u.inputTokens) || 0,
+        tokensOut: Number(u.outputTokens) || 0,
+      });
+    }
+  } catch { /* 记账失败不影响探测结果 */ }
+  return result;
+}
+
+async function probeModelInner({ key, model, message, mode = 'single' }) {
   const started = Date.now();
   const elapsed = () => Date.now() - started;
   const limits = PROBE_LIMITS[mode] || PROBE_LIMITS.single;
@@ -636,6 +652,8 @@ async function probeModel({ key, model, message, mode = 'single' }) {
   try {
     await ensureInitialized(key);
     const response = await forwardToCC(ccBody, key, {}, null, null);
+    // 探测也是一次真实的上游调用，同样要计入该 Key 的用量 ——
+    // 否则「我只在后台点测试」的用量会全部显示为 0（用户正是这么反馈的）
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
@@ -1808,6 +1826,41 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
   }
 }
 
+/**
+ * 把一个请求的 token 用量记到对应 Key 上。
+ *
+ * 为什么不逐个终态分支手动记账：三条协议 × 流式/非流式共 6 条收尾路径
+ * （正常完成 / 上游报错 / 零输出 / 客户端断连 …），逐个人工埋点必漏，
+ * 而且很容易在同一条请求上重复累加。这里改成：
+ *   调用方只把「当前已知的 usage」塞进来（赋值，不累加），
+ *   真正的记账挂在 response 的 finish/close 钩子上，配合一次性守卫保证恰好记一次。
+ * 上游没给 token 数（0/0）时不消耗守卫，等后续拿到真实值再记。
+ */
+function attachUsageRecording(res, key) {
+  const box = { usage: null };
+  let done = false;
+
+  const flush = () => {
+    if (done || !box.usage) return;
+    const tokensIn = Number(box.usage.inputTokens) || 0;
+    const tokensOut = Number(box.usage.outputTokens) || 0;
+    if (tokensIn <= 0 && tokensOut <= 0) return;
+    done = true;
+    keyPool.recordTokens(key, { tokensIn, tokensOut });
+  };
+
+  res.once('finish', flush);
+  res.once('close', flush);
+
+  return (u) => {
+    if (!u) return;
+    const tokensIn = u.inputTokens ?? u.input_tokens;
+    const tokensOut = u.outputTokens ?? u.output_tokens;
+    if (tokensIn === undefined && tokensOut === undefined) return;
+    box.usage = { inputTokens: tokensIn, outputTokens: tokensOut };
+  };
+}
+
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
@@ -1830,6 +1883,7 @@ async function handleChatCompletions(req, res) {
   }
   const apiKey = auth.upstreamKey;
 
+  const trackUsage = attachUsageRecording(res, apiKey);
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || fallbackModel('deepseek/deepseek-v4-flash', '/chat/completions');
   // 明确被禁用的模型直接拒掉：只在 /v1/models 里隐藏它是不够的 ——
@@ -1862,6 +1916,7 @@ async function handleChatCompletions(req, res) {
   // 记录本次用量，缓存是否命中可直接由此判断。三条终态分支（上游报错、零输出、
   // 正常完成）都要记 —— 零输出时最需要看清的就是缓存到底有没有命中。
   const logUsage = () => {
+    trackUsage(translator);
     log('info', 'Request completed', {
       path: '/v1/chat/completions',
       model,
@@ -2094,6 +2149,7 @@ async function handleChatCompletions(req, res) {
       // 记录本次用量，缓存是否命中可直接由此判断。
       // 三条终态分支（上游报错、零输出、正常完成）都要记。
       const logNonStreamUsage = () => {
+        trackUsage(usage);
         log('info', 'Request completed', {
           path: '/v1/chat/completions',
           model,
@@ -2787,6 +2843,7 @@ async function handleMessages(req, res) {
   }
   const apiKey = auth.upstreamKey;
 
+  const trackUsage = attachUsageRecording(res, apiKey);
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || fallbackModel('claude-sonnet-4-6', '/messages');
   const disabledErr = disabledModelError(anthropicReq.model);
@@ -3019,7 +3076,7 @@ async function handleMessages(req, res) {
                 lastCcEvent = event.type;
                 sawFinish = true;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
-                if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
+                if (event.totalUsage || event.usage) { usage = event.totalUsage || event.usage; trackUsage(usage); }
                 break;
               case 'error':
                 lastCcEvent = event.type;
@@ -3090,6 +3147,7 @@ async function handleMessages(req, res) {
       }
 
       consecutiveTimeouts = 0;
+      trackUsage(usage);
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
@@ -3596,6 +3654,7 @@ async function handleResponses(req, res) {
     return;
   }
 
+  const trackUsage = attachUsageRecording(res, apiKey);
   const stream = chatReq.stream === true;
   const model = chatReq.model || fallbackModel('deepseek/deepseek-v4-flash', '/chat/completions');
   const disabledErr = disabledModelError(chatReq.model);
@@ -3792,7 +3851,7 @@ async function handleResponses(req, res) {
               lastCcEvent = event.type;
               sawFinish = true;
               finishReason = mapFinishReason(event.finishReason || 'stop');
-              if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
+              if (event.totalUsage || event.usage) { usage = event.totalUsage || event.usage; trackUsage(usage); }
               break;
             case 'error':
               lastCcEvent = event.type;
@@ -3864,6 +3923,7 @@ async function handleResponses(req, res) {
 
       consecutiveTimeouts = 0;
       echoOpts.finishReason = finishReason;
+      trackUsage(usage);
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
     }
