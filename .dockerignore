@@ -14,3 +14,8 @@ data/
 temp/
 README*.md
 AGENTS.md
+
+# 以下是构建期不需要的（不进镜像，也没必要塞进构建上下文）
+test/
+docs/
+.github/

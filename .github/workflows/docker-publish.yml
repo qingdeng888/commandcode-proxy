@@ -6,6 +6,9 @@ on:
       - master
       - main
       - release
+      # v2 是新一代分支：推它也会构建镜像，但只产出 :v2 标签（绝不覆盖 :latest，
+      # 那是稳定版的位置 —— 让 v2 覆盖 latest 会把用 latest 的人直接换到新大版本）
+      - v2
     tags:
       - 'v*'
   workflow_dispatch:
@@ -44,6 +47,7 @@ jobs:
           tags: |
             type=ref,event=tag
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
+            type=raw,value=v2,enable=${{ github.ref == 'refs/heads/v2' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
