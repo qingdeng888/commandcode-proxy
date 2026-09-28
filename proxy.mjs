@@ -520,8 +520,12 @@ const MAX_TEST_MESSAGE_LEN = 4000;
 //   batch  —— 一次性跑几十上百个模型，只为分类（通/不通/没额度），
 //             每个都收长篇会既慢又贵，所以只收一小段。
 const PROBE_LIMITS = {
-  single: { maxTokens: 1024, maxChars: 3000 },
-  batch: { maxTokens: 64, maxChars: 400 },
+  // 单次：要能看到正文，而推理型模型会把思考也计入上限（实测同一条问题思考量在
+  // 50~1024+ token 之间波动，给 1024 时出现过「1024 全被思考吃光、正文为空」），
+  // 所以给足预算。
+  single: { maxTokens: 4096, maxChars: 4000 },
+  // 批量：只为分类，给一点点就够（并刻意压低推理开销）
+  batch: { maxTokens: 256, maxChars: 400 },
 };
 
 /** 归一化测试消息：空/非字符串 → 默认值；过长 → 报错（由调用方转成 400） */
@@ -547,6 +551,7 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
   const deadline = Date.now() + timeoutMs;
   let buffer = '';
   let text = '';
+  let reasoning = '';      // 思考内容单独收：正文为空时它就是唯一的诊断线索
   let streamError = null;
   let sawFinish = false;
   let finishReason = null;
@@ -568,6 +573,7 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }
         if (ev.type === 'text-delta' && typeof ev.text === 'string') text += ev.text;
+        else if ((ev.type === 'reasoning-delta' || ev.type === 'reasoning') && typeof ev.text === 'string') reasoning += ev.text;
         else if (ev.type === 'error') {
           streamError = ev.error?.message || ev.error?.code || JSON.stringify(ev.error || ev);
         } else if (ev.type === 'finish') {
@@ -584,7 +590,7 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
     try { await reader.cancel(); } catch {}
   }
 
-  return { text, streamError, sawFinish, finishReason, usage, bytes };
+  return { text, reasoning, streamError, sawFinish, finishReason, usage, bytes };
 }
 
 /**
@@ -610,7 +616,12 @@ async function probeModel({ key, model, message, mode = 'single' }) {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: limits.maxTokens,
       stream: true,
-    });
+      // 探测**刻意**不发「空 system 占位」：那个占位是为了省掉 CC 注入的 ~7.5K 默认
+      // 系统提示词，但模型失去锚点后容易在思考里无限打转、把 token 上限烧光而不产出正文
+      // （实测：带占位时曾出现 1024 token 全为思考、正文为空；不带占位时 3/3 都有正文）。
+      // 连通性测试的目的是「看看模型回了什么」，这里优先保证回答可读。
+      _skipPlaceholder: true,
+    }, { skipEmptySystemPlaceholder: true });
   } catch (e) {
     return { model, ok: false, category: 'error', latencyMs: elapsed(), httpStatus: null, message: `构造请求失败: ${e.message}`, prompt };
   }
@@ -633,7 +644,7 @@ async function probeModel({ key, model, message, mode = 'single' }) {
       };
     }
 
-    const { text, streamError, sawFinish, finishReason, usage } = await consumeProbeStream(response, { maxChars: limits.maxChars });
+    const { text, reasoning, streamError, sawFinish, finishReason, usage } = await consumeProbeStream(response, { maxChars: limits.maxChars });
 
     if (streamError) {
       const category = classifyProbe({ ok: false, bodyText: String(streamError) });
@@ -645,12 +656,22 @@ async function probeModel({ key, model, message, mode = 'single' }) {
       };
     }
 
-    // 有文本或有 finish 事件即认为该模型可用；两者都没有说明是零输出
-    const ok = text.length > 0 || sawFinish;
-    // 回答被截断时把原因说清楚：是 token 上限，还是上游本来就这么短
+    // 有正文、有思考、或有 finish 事件，都说明链路是通的
+    const hasText = text.length > 0;
+    const hasReasoning = reasoning.length > 0;
+    const ok = hasText || hasReasoning || sawFinish;
     const truncated = finishReason === 'max_tokens' || text.length > limits.maxChars;
+
+    // 把「为什么没有正文」说清楚 —— 这三种情形的处理方式完全不同：
+    //   只有思考没有正文 → token 上限被推理占满（不是故障，也不是额度问题）
+    //   正文被截断        → 达到上限，调大上限或换更短的问题
+    //   真·零输出         → 上游 200 却什么都没发，需要怀疑上游
     let note = ok ? '链路正常' : '上游返回 200 但没有任何输出';
-    if (ok && truncated) {
+    if (ok && !hasText && hasReasoning) {
+      note = `链路正常，但模型把 ${limits.maxTokens} token 上限全用在思考上、没产出正文（可换个更短的问题，或调大测试上限）`;
+    } else if (ok && !hasText && !hasReasoning) {
+      note = '上游返回 200 但没有发送任何内容（既无正文也无思考）';
+    } else if (ok && truncated) {
       note = finishReason === 'max_tokens'
         ? `链路正常（回答达到 token 上限被截断，上限 ${limits.maxTokens}）`
         : '链路正常（回答较长，仅显示前一段）';
@@ -662,6 +683,9 @@ async function probeModel({ key, model, message, mode = 'single' }) {
       latencyMs: elapsed(),
       httpStatus: 200,
       message: note,
+      reasoning: mode === 'batch' ? '' : reasoning,
+      reasoningChars: reasoning.length,
+      textChars: text.length,
       // output 只在单次测试时返回：模型页/批量测试看的是分类，不需要回答正文，
       // 带上它只会把结果列表和 model-tests.json 撑大。
       output: mode === 'batch' ? '' : text,
@@ -737,7 +761,7 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-function buildCcRequest(openaiReq) {
+function buildCcRequest(openaiReq, opts = {}) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
@@ -889,7 +913,7 @@ function buildCcRequest(openaiReq) {
   // 条件字段
   if (systemBlocks.length) {
     body.params.system = systemBlocks;
-  } else if (CFG.emptySystemPlaceholder) {
+  } else if (CFG.emptySystemPlaceholder && !opts.skipEmptySystemPlaceholder) {
     // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（进入
     // 默认上下文/前缀路径），既产生大量 cached tokens 又污染对话（模型会以为
     // 自己在 CC 的可执行目录里，见 issue #17）。发一个空格占位即可绕过，

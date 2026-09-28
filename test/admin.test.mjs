@@ -325,6 +325,12 @@ async function startCatalogUpstream({ generateStatus = 200, generateBody = null,
         return part?.text ?? null;
       } catch { return null; }
     },
+    /** 上游实际收到的完整信封（验证 system / max_tokens / reasoning_effort 等） */
+    lastWireBody: () => {
+      const g = seen.filter(s => s.url === '/alpha/generate').pop();
+      if (!g) return null;
+      try { return JSON.parse(g.raw); } catch { return null; }
+    },
     /** 上游实际收到的信封里用的 model（验证「省略 model 时的兜底」） */
     lastWireModel: () => {
       const g = seen.filter(s => s.url === '/alpha/generate').pop();
@@ -423,6 +429,56 @@ test('结束原因为 max_tokens 时明确标出回答被截断', async () => {
     assert.equal(d.truncated, true);
     assert.equal(d.finishReason, 'max_tokens');
     assert.match(d.message, /token 上限/, '说明里要讲清是被上限截断，而不是让用户以为模型坏了');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('探测信封：不发空 system 占位、单次给足 token 上限', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    await api.post('/models/test', { model: list.models[0].id });
+
+    const body = upstream.lastWireBody();
+    assert.ok(body, '应捕获到探测请求');
+
+    // 不发空 system 占位：带占位时模型失去锚点，容易把 token 上限全用在思考上、不产出正文
+    assert.ok(!body.params.system,
+      `探测不应发送空 system 占位，实际 params.system = ${JSON.stringify(body.params.system)}`);
+
+    // 单次测试要有足够预算（推理也计入上限）
+    assert.equal(body.params.max_tokens, 4096, '单次测试的 token 上限应为 4096');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('模型只思考不产出正文时：如实说明，并把思考内容返回', async () => {
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"reasoning-start"}',
+    '{"type":"reasoning-delta","text":"让我想想这个问题该怎么回答……"}',
+    '{"type":"reasoning-end"}',
+    // 刻意不发任何 text-delta
+    '{"type":"finish","finishReason":"max_tokens","totalUsage":{"inputTokens":40,"outputTokens":4096,"reasoningTokens":4096}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const list = (await (await api.get('/models')).json()).data;
+    const d = (await (await api.post('/models/test', { model: list.models[0].id })).json()).data;
+
+    assert.equal(d.ok, true, '链路是通的（收到了响应与 finish），不应判成故障');
+    assert.equal(d.textChars, 0);
+    assert.ok(d.reasoningChars > 0, '应把思考内容收下来');
+    assert.match(d.reasoning, /让我想想/);
+    assert.match(d.message, /思考/, '说明里要点出「上限被思考占满」，而不是笼统说没有输出');
+    assert.equal(d.truncated, true);
+    assert.equal(d.finishReason, 'max_tokens');
   } finally { await proxy.kill(); await upstream.close(); }
 });
 

@@ -19,6 +19,10 @@ const headline = computed(() => {
 
 // 模型的实际回答：单次测试会带 output（完整），批量只有 outputPreview（短）
 const reply = computed(() => props.result.output || props.result.outputPreview || '')
+// 正文为空但模型确实思考了：把思考内容也展示出来 ——
+// 否则用户只看到「没有返回内容」，完全不知道模型在干什么
+const reasoning = computed(() => props.result.reasoning || '')
+const onlyReasoning = computed(() => !reply.value && !!reasoning.value)
 const tokenText = computed(() => {
   const u = props.result.usage
   if (!u) return ''
@@ -27,6 +31,17 @@ const tokenText = computed(() => {
   if (inTok === undefined && outTok === undefined) return ''
   return `tokens 入 ${fmtNum(inTok ?? 0)} / 出 ${fmtNum(outTok ?? 0)}`
 })
+
+const reasoningChars = computed(() => props.result.reasoningChars || reasoning.value.length)
+
+async function copyReasoning() {
+  try {
+    await navigator.clipboard.writeText(reasoning.value)
+    toast.success('已复制思考内容')
+  } catch {
+    toast.error('复制失败，请手动选择复制')
+  }
+}
 
 async function copyReply() {
   try {
@@ -76,8 +91,26 @@ async function copyReply() {
         <template v-else>内容较长，仅保留前面一段</template>。
       </div>
     </div>
+    <!-- 只有思考、没有正文：把思考内容摊开，让用户看到模型到底在做什么 -->
+    <div
+      v-else-if="onlyReasoning"
+      style="margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px"
+    >
+      <div class="justify-between" style="align-items: center">
+        <span class="stat-mini">
+          思考过程（模型没有产出正文）
+          <span class="badge warn" style="margin-left: 6px">{{ reasoningChars }} 字</span>
+        </span>
+        <button class="btn btn-sm" type="button" @click="copyReasoning">📋 复制思考</button>
+      </div>
+      <pre class="log-data reply-text">{{ reasoning }}</pre>
+      <div class="hint" style="margin-top: 4px">
+        模型把整个 token 上限用在了思考上，没轮到正文。这不是链路故障 ——
+        换个更短的问题通常就能看到回答。
+      </div>
+    </div>
     <div v-else-if="ok" class="hint" style="margin-top: 6px">
-      （上游没有返回文本内容，只确认了链路可用）
+      （上游既没发正文也没发思考内容，只确认了链路可用）
     </div>
   </div>
 </template>
