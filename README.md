@@ -38,7 +38,80 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 ```
 
 > Bound to `0.0.0.0`, this means **anyone who can reach it may use the proxy** (with their own key).
-> To require a password instead, set `proxyKey` — see [Access protection](#access-protection).
+> To require a password instead, set `proxyKey` — see [Access control](#access-control).
+
+## How to use it (5-minute walkthrough)
+
+### 1. Start it
+
+```bash
+cp config.json.example config.json
+ADMIN_PASSWORD=your-admin-password npm start    # listens on 0.0.0.0:3050
+# different port: PORT=37000 ADMIN_PASSWORD=... npm start
+```
+
+Open `http://<host>:3050/admin/` and log in with `ADMIN_PASSWORD`. Without that variable the panel
+**refuses all access**.
+
+### 2. Add an "upstream key" — your Command Code account key
+
+Panel → **🔑 Upstream Key** → paste the `user_…` key → **➕ Add**.
+
+- This is a **server-side credential**: the proxy calls Command Code with it. **Never hand it to a
+  client** — that gives away your account.
+- Effective **immediately, no restart**. Add several and they rotate by strategy, failing over on errors.
+- Want to take one out of rotation temporarily? Click **⏸ Disable** in its row — it leaves the
+  rotation pool at once while its config and usage stats are kept, and **▶ Enable** brings it back.
+  When every key is disabled the page shows a red warning (and all `/v1/*` calls return 500).
+
+### 3. Sync upstream models and choose which ones to expose
+
+Panel → **🧠 Models** → **🔄 Sync upstream models** (it reports what was added/removed) → tick the ones
+you want → **✅ Enable selected**.
+
+- A **disabled model** is no longer returned by `/v1/models`, and naming it explicitly returns **400** —
+  that is how you stop people from using it.
+- The header **select-all** checkbox plus `✅ Enable selected / 🚫 Disable selected` handles batches.
+- `⚡ Test` verifies one model, `🧪 Batch test` runs them all (limited concurrency, cancellable).
+  **Only enabled models can be tested.**
+
+### 4. (Optional, recommended) Issue a "2API key" for callers
+
+Panel → **🔐 2API Key** → **🎲 Generate & add** → copy the `ccp_…` value (shown in full only once).
+
+- Issuing one **turns access control on immediately**: callers must present it, and presenting an
+  upstream `user_` key instead gets a **401 that tells them which credential to use**.
+- The point is **per-client issuance and individual revocation** — one leak only revokes that client,
+  no account rotation needed.
+- Want no access control? **Issue nothing** (pass-through mode: callers bring their own upstream key).
+
+### 5. Point your client at it
+
+The base URL is this proxy; the key depends on the previous step:
+
+| Protocol | Base URL | Key |
+|---|---|---|
+| OpenAI Chat Completions | `http://<host>:3050/v1` | the issued `ccp_…` (or `proxyKey`); in pass-through mode your own `user_` key |
+| Anthropic Messages | same | same (`x-api-key` or `Authorization` both work) |
+| OpenAI Responses | same | same |
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Authorization: Bearer ccp_your_2api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### 6. Verify the link and watch usage
+
+- **📊 Dashboard → upstream connectivity test**: pick a model (only enabled ones are listed), edit the
+  test message (defaults to `你是谁，出来干活了`) and send. The result shows **the model's actual reply**
+  plus **the model and provider that actually served it** — the latter is how you confirm routing.
+- **📈 Usage**: per-key requests and tokens, with **input split into cache hit / miss** and output on
+  its own.
+- **📜 Request Log**: live SSE stream with pause, clear and level filter.
+- **⚙️ Settings**: rotation strategy, default test model, upstream proxy, log level — persisted and
+  effective immediately.
 
 ## File Structure
 
@@ -256,11 +329,11 @@ ADMIN_PASSWORD=your-admin-password npm start
 |------|----------|
 | 📊 Dashboard | Key / model / request / token stats, upstream connectivity test |
 | 🔐 **2API Keys** | Calling credentials issued to **downstream clients**: generate, revoke individually, enable/disable, reveal, per-key request counts. The page opens with a "differences between the two key types" table |
-| 🔑 **Upstream Keys** | Command Code account credentials (`user_`): add/edit/delete, enable/disable, 👁 reveal, ⚡ real probe, import from `config`/`env`, rotation strategy |
-| 🧠 Models | Upstream catalog (context length + supported endpoints), single-model test, batch test (limited concurrency, cancellable) |
-| 📈 Usage | Per-key requests / failures / tokens (today and total), resettable |
+| 🔑 **Upstream Keys** | Command Code account credentials (`user_`): add/edit/delete, **one-click ⏸ disable / ▶ enable**, 👁 reveal, ⚡ real probe, import from `config`/`env`, rotation strategy |
+| 🧠 Models | **🔄 Sync upstream models**, **multi-select / select-all then batch enable or disable**, single-model test, batch test (limited concurrency, cancellable); only enabled models can be tested |
+| 📈 Usage | Per-key requests / failures / tokens (today and total): **input split into cache hit / miss, output on its own**, resettable |
 | 📜 Request Log | **SSE live stream** (not polling) with pause, clear and level filter |
-| ⚙️ Settings | Hot-update runtime config, change the admin password |
+| ⚙️ Settings | Hot-update runtime config (including the **default test model**), change the admin password |
 
 ### Key sources
 
@@ -271,6 +344,18 @@ ADMIN_PASSWORD=your-admin-password npm start
 | `env` | `CC_API_KEY` | ❌ read-only; same |
 
 All three merge into **one rotation pool**; the same key never appears under two sources (`ui` wins).
+
+**One-click disable / enable.** The row button `⏸ Disable` / `▶ Enable` takes effect immediately:
+
+| After disabling | Detail |
+|---|---|
+| Leaves the rotation pool at once | It is genuinely not used upstream any more — not just flagged |
+| Config and stats kept | Key, label, usage and health records all stay; **▶ Enable** brings it back |
+| Row is dimmed | The header counters read `N total · X enabled · Y disabled` |
+| If every key is disabled | **All `/v1/*` calls return 500**, and the page shows a red warning — an explicit failure rather than silently sourcing a credential elsewhere |
+
+> Read-only keys (`config` / `env`) are refused by the server with the reason (import them first to
+> manage them). The button stays clickable on purpose: being told why beats guessing.
 
 **Rotation strategies:** `round_robin` (default), `random` (with consecutive-repeat avoidance —
 pure random tends to hammer a single account; after 8 repeats avoidance is dropped to break
@@ -354,6 +439,28 @@ also default to **enabled models only** when no explicit list is given.
 
 > Disabled ids no longer present upstream are reported as a count (`staleDisabled`) but never
 > auto-pruned — auto-pruning would turn a transient upstream blip into "your settings got wiped".
+
+#### Confirming the test really hit the model you picked
+
+Results include a **"served by `<modelId>` @ `<provider>`"** line taken from the upstream-reported
+metadata — that is the reliable way to verify routing (green ✓ when it matches, red plus an
+explanation when it does not).
+
+> ⚠️ **Never judge by the model's self-description.** Asking "which model are you" is not trustworthy —
+> the same `deepseek/deepseek-v4.1-flash` called DeepSeek 3 times out of 5 and Claude the other 2;
+> Kimi / GLM / Qwen mostly claim Claude too. Models have no introspective access to their own
+> identity and answer from training-data priors. **Trust the metadata.**
+
+Note the token budget deliberately differs between single and batch tests: single gets enough (4096)
+to show a full answer, batch gets 256 purely to classify — otherwise dozens of models would be slow
+and expensive.
+
+#### Default test model
+
+**Settings → default test model**: the dashboard's model dropdown **pre-selects** it (falling back to
+the first enabled model), and you can still pick another one just for that test. It is also the
+fallback when a client calls `/v1/*` **without a `model`** — so if you only enable one or two models,
+set it to one of them.
 
 #### Test message
 
@@ -818,7 +925,19 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
   ghcr.io/qingdeng888/commandcode-proxy:latest
 ```
 
-Pushes to `master` / `main` update the `latest` tag; `v*` tags produce additional version tags.
+Image tags:
+
+| Tag | Source | Notes |
+|-----|--------|-------|
+| `:latest` | `master` / `main` / `release` branches, or `v*` tags | **Stable.** Follows those branches |
+| `:v2` | `v2` branch | Builds of the next-generation branch. **Deliberately does not overwrite `latest`** — doing so would silently move every `latest` user onto a new major version |
+| `:release` | `release` branch | Tracks the release branch |
+| version | `v*` tags | e.g. `:v1.1.0` |
+
+```bash
+# to use the v2 branch build:
+docker pull ghcr.io/qingdeng888/commandcode-proxy:v2
+```
 
 > ℹ️ **GHCR packages are private by default**, so log in before pulling:
 >
