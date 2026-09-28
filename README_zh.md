@@ -53,6 +53,9 @@ ADMIN_PASSWORD=你的管理密码 npm start        # 默认监听 0.0.0.0:3050
 
 打开 `http://<主机>:3050/admin/`，用 `ADMIN_PASSWORD` 登录。未设该变量时后台**整体拒绝访问**。
 
+> 不想每次 `export`？`cp .env.example .env` 填好再启动即可，程序与 Docker 都会读它
+> （见[用 .env 配置](#用-env-配置推荐)）。
+
 ### 2. 加「上游 Key」= 你的 Command Code 账号 Key
 
 后台 → **🔑 上游 Key** → 填 `user_` 开头的 Key → **➕ 添加**。
@@ -169,6 +172,41 @@ commandcode/
 
 > 📌 `config.json` 是**部署期输入**。后台（`/admin/`）改动的是 `data/settings.json`，
 > 不会改写这个文件 —— 所以 Docker 里它可以安全地只读挂载。分层优先级见 [Web 管理后台](#web-管理后台)。
+
+### 用 .env 配置（推荐）
+
+不必每次 `export`，把配置写进项目根目录的 `.env` 即可 —— **非 Docker 与 Docker 都支持**：
+
+```bash
+cp .env.example .env
+vim .env                     # 至少填 ADMIN_PASSWORD；上游 Key 建议去后台加，更灵活
+npm start                    # 程序自己会读 .env
+```
+
+```bash
+# Docker：compose 会自动读取同目录的 .env 并注入容器（无需改 compose 文件）
+cp .env.example .env
+docker compose up -d
+```
+
+`.env.example` 里每一项都有注释，常用的这些：
+
+| 变量 | 用途 |
+|---|---|
+| `ADMIN_PASSWORD` | **后台访问密码**（不设则后台整体拒绝访问）|
+| `PROXY_KEY` | 数据面共享口令（用了 2API Key 就不需要它）|
+| `CC_API_KEY` | 上游 Key，多个用逗号分隔（也可在后台添加）|
+| `CC_UPSTREAM_PROXY` | 让发往上游的请求走 HTTP 代理 |
+| `CC_LOG_LEVEL` | 日志级别 `debug/info/warn/error` |
+| `CC_DATA_DIR` | 运行时数据目录（Docker 必须挂卷）|
+| `PROXY_PORT` | 宿主机映射端口（仅 compose 读取）|
+
+**优先级（从高到低）**：真实环境变量 > `.env` > `data/settings.json`（后台写入）> `config.json` > 内置默认值。
+
+- 已在 shell 里 `export` 的同名变量会**压过 `.env`**（刻意的，方便临时覆盖）。
+- 解析很朴素：`KEY=VALUE`、`#` 注释、空行；值两端成对的引号会去掉；**空值等同于没配**。
+- 启动横幅会打印 `.env` 是否被加载、加载了哪些**键名**（值不打印 —— 里面有密码）。
+- `.env` 已被 `.gitignore` 与 `.dockerignore` 双重排除，不会被提交、也不会进镜像。
 
 ### 环境变量
 
@@ -1025,17 +1063,27 @@ volumes:
 > 💡 只想用配置文件管 Key 也可以：把 Key 写进 `config.json` 的 `apiKey` 或 `CC_API_KEY` 环境变量，
 > 它们会以**只读**条目出现在后台，不依赖 `data/` 卷。后台的增删改才会写 `data/`。
 
-### 管理后台密码（Docker）
+### 配置变量（Docker）
+
+推荐直接复制模板：`cp .env.example .env`，然后在里面填 `ADMIN_PASSWORD` 等。compose 会自动读取
+同目录的 `.env` 并注入容器，**不需要改 compose 文件**：
 
 ```bash
-# 方式一：compose 同目录放 .env（compose 会自动读取并注入）
-echo 'ADMIN_PASSWORD=你的管理密码' > .env
-
-# 方式二：直接传环境变量
-ADMIN_PASSWORD=你的管理密码 docker compose up -d
+cp .env.example .env
+vim .env                      # 至少填 ADMIN_PASSWORD
+docker compose up -d
 ```
 
-未设置时后台整体拒绝访问（不是「无密码可进」），启动日志会给出明确警告。
+也可以直接传：
+
+```bash
+ADMIN_PASSWORD=你的管理密码 CC_API_KEY=user_xxx docker compose up -d
+```
+
+优先级：**宿主环境变量 > `.env`**（同一个变量在 shell 里 export 过，就以 shell 为准）。
+
+> 容器内 `PORT` 固定为 `3050`（编排与健康检查依赖它），要换对外端口用 `PROXY_PORT`。
+> 未设置 `ADMIN_PASSWORD` 时后台整体拒绝访问（不是「无密码可进」），启动日志会给出明确警告。
 
 ### 从源码构建（本地开发）
 

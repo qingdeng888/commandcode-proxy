@@ -17,7 +17,7 @@ import { appendFileSync } from 'fs';
 //   1) CFG 是**同一个对象**，lib/config.mjs 靠 Object.assign 原地改 —— 下面几百处
 //      `CFG.xxx` 读取无需改动，也不会出现「新旧两份配置」并存的窗口；
 //   2) Key 池在每次选 Key 时现取，后台改完立即生效，不需要重启也不需要 fs.watch。
-import { CFG, startConfigWatcher } from './lib/config.mjs';
+import { CFG, DOTENV, startConfigWatcher } from './lib/config.mjs';
 import { DATA_DIR } from './lib/store.mjs';
 import { createLogBus, levelEnabled } from './lib/logbus.mjs';
 import { createKeyPool } from './lib/keys.mjs';
@@ -4131,6 +4131,12 @@ server.listen(CFG.port, CFG.host, () => {
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health 与 /admin/* 豁免)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
     dataDir: DATA_DIR,
+    // 明确说出 .env 有没有被读到、读了哪些键（值不打印，里面有密码）。
+    // 容器里必然是「未找到」—— Docker 下 .env 由 compose 在宿主侧读取后作为真实环境变量注入，
+    // 文件本身不在容器内，这里点明以免被误解成配置没生效。
+    dotenv: DOTENV.found
+      ? `已加载（${DOTENV.keys.length} 项：${DOTENV.keys.join(', ')}）`
+      : '本项目目录未找到 .env（Docker 下由 compose 注入环境变量，属正常）',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });

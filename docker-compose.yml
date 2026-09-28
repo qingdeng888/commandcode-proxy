@@ -8,11 +8,26 @@ services:
       - "${PROXY_PORT:-3050}:3050"
     environment:
       # 容器内端口固定 3050：环境变量优先级高于挂载的 config.json（见 README「Docker 部署」）
-      PORT: "3050"
-      HOST: "0.0.0.0"
-      # 管理后台访问密码。未设置时 /admin/ 整体拒绝访问（不是「无密码可进」）。
-      # 也可以在 config.json 同级放 .env 文件写 ADMIN_PASSWORD=...，compose 会自动读取。
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      - PORT=3050
+      - HOST=0.0.0.0
+      # 其余变量按需注入：值取自「宿主环境变量」或「同目录 .env」（compose 自动读取 .env，
+      # 且宿主环境变量优先）。
+      #
+      # 这里刻意用列表的「无值」形式（`- VAR`）而不是 `VAR: "${VAR:-}"`：
+      # 实测前者在未设置时容器里就是「变量不存在」，后者会注入一个**空串** ——
+      # 而空串作为环境变量同样会压过 config.json，等于静默屏蔽掉那边的 apiKey / proxyKey。
+      - ADMIN_PASSWORD
+      - PROXY_KEY
+      - CC_API_KEY
+      - CC_API_BASE
+      - CC_UPSTREAM_PROXY
+      - CC_LOG_LEVEL
+      - CC_USE_PROVIDER_MODELS
+      - CC_MAX_INFLIGHT
+      - CMD_ZDR
+      - CC_FINGERPRINT_SALT
+      - CC_DEVICE_PROJECT_DIR
+      - ADMIN_COOKIE_SECURE
     volumes:
       # 挂载本地配置，提供 proxyKey / apiKey
       # ⚠️ 首次部署先执行：cp config.json.example config.json

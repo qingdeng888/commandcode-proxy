@@ -53,6 +53,9 @@ ADMIN_PASSWORD=your-admin-password npm start    # listens on 0.0.0.0:3050
 Open `http://<host>:3050/admin/` and log in with `ADMIN_PASSWORD`. Without that variable the panel
 **refuses all access**.
 
+> Prefer not to `export` every time? `cp .env.example .env`, fill it in, and start — both the app and
+> Docker read it (see [Configuring with .env](#configuring-with-env-recommended)).
+
 ### 2. Add an "upstream key" — your Command Code account key
 
 Panel → **🔑 Upstream Key** → paste the `user_…` key → **➕ Add**.
@@ -176,6 +179,46 @@ commandcode/
 > 📌 `config.json` is **deployment-time input**. The panel (`/admin/`) writes to
 > `data/settings.json` and never rewrites this file — which is why it is safe to mount read-only
 > under Docker. See [Web Admin Panel](#web-admin-panel) for the precedence rules.
+
+### Configuring with .env (recommended)
+
+Instead of exporting variables every time, put them in a `.env` at the project root —
+**works for both bare-metal and Docker**:
+
+```bash
+cp .env.example .env
+vim .env                     # at least set ADMIN_PASSWORD; add upstream keys in the panel instead
+npm start                    # the app reads .env itself
+```
+
+```bash
+# Docker: compose reads the .env next to it and injects it — no compose edits needed
+cp .env.example .env
+docker compose up -d
+```
+
+Every line in `.env.example` is commented; the common ones:
+
+| Variable | Purpose |
+|---|---|
+| `ADMIN_PASSWORD` | **Panel password** (unset ⇒ the panel refuses all access) |
+| `PROXY_KEY` | Shared data-plane password (unnecessary once you use 2API keys) |
+| `CC_API_KEY` | Upstream keys, comma-separated (or add them in the panel) |
+| `CC_UPSTREAM_PROXY` | Route requests to the upstream through an HTTP proxy |
+| `CC_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
+| `CC_DATA_DIR` | Runtime data directory (must be a volume under Docker) |
+| `PROXY_PORT` | Host port to publish (compose only) |
+
+**Precedence (highest first):** real environment variable > `.env` > `data/settings.json`
+(panel writes) > `config.json` > built-in defaults.
+
+- A variable already `export`ed in your shell **beats `.env`** (deliberate, for temporary overrides).
+- Parsing is deliberately simple: `KEY=VALUE`, `#` comments, blank lines; matching surrounding quotes
+  are stripped; **an empty value counts as unset**.
+- The startup banner reports whether `.env` was loaded and which **names** (never values — it holds
+  passwords).
+- `.env` is excluded by both `.gitignore` and `.dockerignore`, so it is neither committed nor baked
+  into the image.
 
 ### Environment Variables
 
@@ -1006,18 +1049,28 @@ The image declares it as a `VOLUME`, so bare `docker run` needs an explicit
 > or the `CC_API_KEY` variable. They show up as **read-only** entries in the panel and need no
 > `data/` volume. Only panel edits write to `data/`.
 
-### Admin password (Docker)
+### Configuring variables (Docker)
+
+Copy the template — `cp .env.example .env` — and fill in `ADMIN_PASSWORD` etc. Compose reads the
+`.env` next to it automatically and injects it; **no compose edits needed**:
 
 ```bash
-# Option 1: a .env file next to your compose file (compose reads it automatically)
-echo 'ADMIN_PASSWORD=your-admin-password' > .env
-
-# Option 2: pass it directly
-ADMIN_PASSWORD=your-admin-password docker compose up -d
+cp .env.example .env
+vim .env                      # at least set ADMIN_PASSWORD
+docker compose up -d
 ```
 
-Unset means the panel refuses all access (it is *not* "no password required"), and the startup log
-says so explicitly.
+Or pass them inline:
+
+```bash
+ADMIN_PASSWORD=your-admin-password CC_API_KEY=user_xxx docker compose up -d
+```
+
+Precedence: **host environment > `.env`** (if you exported the variable, the shell wins).
+
+> `PORT` inside the container is fixed at `3050` (the orchestration and healthcheck rely on it); use
+> `PROXY_PORT` to change the published port. With `ADMIN_PASSWORD` unset the panel refuses all access
+> (it is *not* "no password required") and the startup log says so explicitly.
 
 ### Environment Variables
 

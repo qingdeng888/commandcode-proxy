@@ -855,6 +855,65 @@ test('设置接口可热改策略与默认模型，非法值被拒', async () =>
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
+// ── ⑨a .env 配置 ─────────────────────────────────────
+
+/** 登录后带 Cookie 请求（.env 测试用） */
+async function postJson(proxy, path, body, password) {
+  const { cookie } = await login(proxy, password);
+  return proxy.get(path, { headers: { Cookie: cookie } });
+}
+
+
+test('.env 会被程序读取；真实环境变量优先于 .env', async () => {
+  const upstream = await startCatalogUpstream();
+
+  // ① 只有 .env 提供 ADMIN_PASSWORD（helper 不传该环境变量）
+  const wd1 = mkdtempSync(join(tmpdir(), 'ccp-dotenv-'));
+  seedConfig(wd1);
+  writeFileSync(join(wd1, '.env'), [
+    '# 注释行应被忽略',
+    'ADMIN_PASSWORD=dotenv-pass-123',
+    'PROJECT_SLUG=dotenv-slug',
+    'EMPTY_ONE=',
+    '这行不是合法键值对',
+  ].join('\n') + '\n');
+  const p1 = await startProxy({
+    upstreamPort: upstream.port, cwd: wd1,
+    env: { CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    assert.equal((await login(p1, 'dotenv-pass-123')).status, 200,
+      '.env 里的 ADMIN_PASSWORD 应生效（非 Docker 运行也能用 .env）');
+    assert.equal((await login(p1, 'wrong-pass')).status, 401);
+    // 非口令类的变量也要生效（证明是整份 .env 被读取，不只是碰巧读到了密码）
+    const cfg = (await (await postJson(p1, '/admin/api/config', null, 'dotenv-pass-123')).json()).data;
+    assert.equal(cfg.projectSlug, 'dotenv-slug', '.env 里的 PROJECT_SLUG 应生效');
+
+    // 启动横幅要说清 .env 被用了（值不打印，里面有密码）
+    assert.match(p1.logs(), /dotenv.*已加载/, '启动日志应报告 .env 已加载');
+    assert.ok(!p1.logs().includes('dotenv-pass-123'), '日志里绝不能出现口令明文');
+  } finally { await p1.kill(); }
+
+  // ② 真实环境变量优先：同名时 .env 的值必须被忽略
+  const wd2 = mkdtempSync(join(tmpdir(), 'ccp-dotenv2-'));
+  seedConfig(wd2);
+  writeFileSync(join(wd2, '.env'), 'ADMIN_PASSWORD=should-be-ignored\n');
+  const p2 = await startProxy({
+    upstreamPort: upstream.port, cwd: wd2,
+    env: { ADMIN_PASSWORD: 'real-env-pass-456', CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    assert.equal((await login(p2, 'real-env-pass-456')).status, 200, '真实环境变量应生效');
+    assert.equal((await login(p2, 'should-be-ignored')).status, 401,
+      '.env 不能覆盖真实环境变量');
+  } finally {
+    await p2.kill();
+    await upstream.close();
+    rmSync(wd1, { recursive: true, force: true });
+    rmSync(wd2, { recursive: true, force: true });
+  }
+});
+
 // ── ⑨b 上游 Key 的停用 / 启用 ──────────────────────────
 
 test('上游 Key 停用后立即退出轮询池，重新启用后恢复（无需重启）', async () => {

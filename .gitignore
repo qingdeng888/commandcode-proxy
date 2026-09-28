@@ -3,6 +3,8 @@ node_modules/
 *.zip
 # 本地配置：由 config.json.example 复制而来，含 proxyKey / apiKey，不应入库
 config.json
+# 本地环境变量文件（含 ADMIN_PASSWORD / CC_API_KEY），由 .env.example 复制而来
+.env
 # 数据目录：keys.json 含上游 Key 明文、.admin-auth.json 含后台密码哈希，
 # 绝不能进版本控制；model-tests.json 与请求日志同理
 data/
