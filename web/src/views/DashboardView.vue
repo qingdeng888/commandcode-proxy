@@ -201,10 +201,10 @@ onUnmounted(() => {
       <StatCard :value="fmtNum(requests.today)" label="今日请求" tone="blue" :sub="`累计 ${fmtNum(requests.total)}`" />
       <StatCard :value="fmtNum(requests.failedToday)" label="今日失败" tone="red" :sub="`进行中 ${fmtNum(requests.inflight)}`" />
       <StatCard
-        :value="`${fmtTokens(tokens.inToday)} / ${fmtTokens(tokens.outToday)}`"
-        label="今日 Tokens"
+        :value="`${fmtTokens(tokens.cacheReadToday)} / ${fmtTokens(tokens.cacheMissToday)} / ${fmtTokens(tokens.outToday)}`"
+        label="今日 Tokens（命中 / 未命中 / 输出）"
         tone="yellow"
-        :sub="`输入 / 输出 · 缓存命中 ${fmtPct(tokens.cacheHitRateToday)}（${fmtTokens(tokens.cacheReadToday)}）· 累计 ${fmtTokens(tokens.inTotal)} / ${fmtTokens(tokens.outTotal)}`"
+        :sub="`前两项是输入拆分（命中率 ${fmtPct(tokens.cacheHitRateToday)}，输入合计 ${fmtTokens(tokens.inToday)}）· 输出 ${fmtTokens(tokens.outToday)} · 累计 ${fmtTokens(tokens.inTotal)} / ${fmtTokens(tokens.outTotal)}`"
       />
       <StatCard
         :value="fmtNum(modelsInfo.total)"
