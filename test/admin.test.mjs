@@ -432,7 +432,57 @@ test('结束原因为 max_tokens 时明确标出回答被截断', async () => {
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
-test('探测信封：不发空 system 占位、单次给足 token 上限', async () => {
+test('返回上游实际服务的模型与厂商，用于核实路由命中（模型自述不可信）', async () => {
+  // 情况一：上游回报的 modelId 与请求一致
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"我是 Claude"}',
+    '{"type":"finish-step","finishReason":"stop","providerMetadata":{"novita":{}},"response":{"modelId":"deepseek/deepseek-v4.1-flash"}}',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":40,"outputTokens":20}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const ids = (await (await api.get('/models')).json()).data.models.map(m => m.id);
+    // 目录里没有 deepseek/deepseek-v4.1-flash，用 mock 的第一个模型，但让上游回报成它
+    const requested = ids[1];
+    const d = (await (await api.post('/models/test', { model: requested })).json()).data;
+
+    assert.equal(d.upstreamModel, 'deepseek/deepseek-v4.1-flash', '应回报上游实际服务的模型');
+    assert.equal(d.upstreamProvider, 'novita', '应回报上游实际使用的厂商');
+    assert.equal(d.modelMatched, false, '与请求不一致时 modelMatched 必须为 false');
+    assert.match(d.message, /上游实际服务的是 deepseek\/deepseek-v4\.1-flash/, '不一致要在 message 里明说');
+    // 模型自述说自己是 Claude，但结论以元数据为准 —— 这正是要防的乌龙
+    assert.equal(d.output, '我是 Claude');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('一致时标记为命中，且不产生误导性警告', async () => {
+  const upstream = await startCatalogUpstream({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"pong"}',
+    '{"type":"finish-step","finishReason":"stop","providerMetadata":{"deepinfra":{}},"response":{"modelId":"claude-sonnet-5"}}',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":40,"outputTokens":3}}',
+  ] });
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');
+    const d = (await (await api.post('/models/test', { model: 'claude-sonnet-5' })).json()).data;
+    assert.equal(d.upstreamModel, 'claude-sonnet-5');
+    assert.equal(d.upstreamProvider, 'deepinfra');
+    assert.equal(d.modelMatched, true);
+    assert.ok(!/不一致/.test(d.message), '一致时不应出现不一致警告');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('探测信封：model 就是所选的模型，且单次给足 token 上限', async () => {
   const upstream = await startCatalogUpstream();
   const proxy = await startProxy({
     upstreamPort: upstream.port,
@@ -441,17 +491,30 @@ test('探测信封：不发空 system 占位、单次给足 token 上限', async
   try {
     const api = await authed(proxy);
     const list = (await (await api.get('/models')).json()).data;
-    await api.post('/models/test', { model: list.models[0].id });
+    const requested = list.models[1].id;
 
+    // 单次测试
+    await api.post('/models/test', { model: requested });
     const body = upstream.lastWireBody();
     assert.ok(body, '应捕获到探测请求');
 
-    // 不发空 system 占位：带占位时模型失去锚点，容易把 token 上限全用在思考上、不产出正文
-    assert.ok(!body.params.system,
-      `探测不应发送空 system 占位，实际 params.system = ${JSON.stringify(body.params.system)}`);
+    // 最关键的一条：发出去的 model 必须就是选的那个（用户明确要求核实这点）
+    assert.equal(body.params.model, requested, '探测请求的 model 必须等于所选模型');
+    assert.ok(body.params.messages.length > 0, '应带上测试消息');
 
-    // 单次测试要有足够预算（推理也计入上限）
+    // 单次要有足够预算：推理也计入上限，4096 才留得下正文
     assert.equal(body.params.max_tokens, 4096, '单次测试的 token 上限应为 4096');
+    // 发空 system 占位是刻意的：能省掉 CC 注入的约 7.5K 默认提示词
+    // （实测输入 42 vs 7602 token），而预算给足后正文同样稳定出现
+    assert.deepEqual(body.params.system, [{ type: 'text', text: ' ' }],
+      '探测应发送空 system 占位以省下约 7.5K 输入 token');
+
+    // 批量：预算收紧、model 同样要正确
+    await api.post('/models/test-batch', { models: [requested], concurrency: 1 });
+    await new Promise(r => setTimeout(r, 600));
+    const batchBody = upstream.lastWireBody();
+    assert.equal(batchBody.params.model, requested, '批量探测的 model 也必须正确');
+    assert.equal(batchBody.params.max_tokens, 256, '批量探测的 token 上限应为 256');
   } finally { await proxy.kill(); await upstream.close(); }
 });
 

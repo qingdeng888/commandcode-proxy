@@ -65,13 +65,26 @@ async function copyReply() {
       <span v-if="result.httpStatus !== undefined && result.httpStatus !== null" class="stat-mini">
         HTTP {{ result.httpStatus }}
       </span>
-      <span v-if="result.model" class="stat-mini">模型 {{ result.model }}</span>
+      <span v-if="result.model" class="stat-mini">请求模型 {{ result.model }}</span>
+      <span
+        v-if="result.upstreamModel"
+        class="stat-mini"
+        :class="result.modelMatched === false ? 'text-danger' : 'text-green'"
+        :title="result.modelMatched === false ? '上游实际服务的模型与请求的不一致，请检查路由' : '上游回报的实际模型，与请求一致'"
+      >
+        上游实际服务 {{ result.upstreamModel }}<template v-if="result.upstreamProvider"> @ {{ result.upstreamProvider }}</template>
+        {{ result.modelMatched === false ? '⚠️ 不一致' : '✓' }}
+      </span>
       <span v-if="result.keyId" class="stat-mini">Key {{ result.keyId }}</span>
       <span v-if="tokenText" class="stat-mini">{{ tokenText }}</span>
       <span v-if="result.finishReason" class="stat-mini">finish {{ result.finishReason }}</span>
       <span v-if="result.checkedAt" class="stat-mini">检测于 {{ fmtDateTime(result.checkedAt) }}</span>
     </div>
     <div class="hint">{{ result.message || '（上游未返回说明）' }}</div>
+    <div v-if="result.upstreamModel" class="hint" style="margin-top: 2px">
+      以上「上游实际服务」由上游回报的元数据得出，是核实路由是否命中的可靠依据；
+      模型**自述**「我是什么模型」不具参考性（实测同一模型会时而说 DeepSeek、时而说 Claude）。
+    </div>
     <div v-if="result.prompt" class="hint" style="margin-top: 4px">
       发送内容：<code>{{ result.prompt }}</code>
     </div>

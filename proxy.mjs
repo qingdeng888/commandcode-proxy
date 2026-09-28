@@ -556,6 +556,11 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
   let sawFinish = false;
   let finishReason = null;
   let usage = null;
+  // 上游自报的「实际服务的模型与厂商」—— 这是核实路由有没有命中唯一可靠的依据。
+  // （模型自述「我是什么模型」完全不可信：实测同一模型 5 次里有 3 次说 DeepSeek、
+  //   2 次说 Claude，因为它没有对自身身份的内省能力。）
+  let upstreamModel = null;
+  let upstreamProvider = null;
   let bytes = 0;
 
   try {
@@ -580,6 +585,13 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
           sawFinish = true;
           if (ev.finishReason) finishReason = ev.finishReason;
           if (ev.totalUsage) usage = ev.totalUsage;
+        } else if (ev.type === 'finish-step') {
+          if (ev.response?.modelId) upstreamModel = ev.response.modelId;
+          if (ev.providerMetadata) upstreamProvider = Object.keys(ev.providerMetadata).join(', ');
+          if (ev.usage && !usage) usage = ev.usage;
+          if (ev.finishReason && !finishReason) finishReason = ev.finishReason;
+        } else if (ev.type === 'provider-metadata' && ev.providerMetadata) {
+          upstreamProvider = Object.keys(ev.providerMetadata).join(', ');
         }
       }
 
@@ -590,7 +602,7 @@ async function consumeProbeStream(response, { timeoutMs = 45000, maxChars = 3000
     try { await reader.cancel(); } catch {}
   }
 
-  return { text, reasoning, streamError, sawFinish, finishReason, usage, bytes };
+  return { text, reasoning, streamError, sawFinish, finishReason, usage, upstreamModel, upstreamProvider, bytes };
 }
 
 /**
@@ -616,12 +628,7 @@ async function probeModel({ key, model, message, mode = 'single' }) {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: limits.maxTokens,
       stream: true,
-      // 探测**刻意**不发「空 system 占位」：那个占位是为了省掉 CC 注入的 ~7.5K 默认
-      // 系统提示词，但模型失去锚点后容易在思考里无限打转、把 token 上限烧光而不产出正文
-      // （实测：带占位时曾出现 1024 token 全为思考、正文为空；不带占位时 3/3 都有正文）。
-      // 连通性测试的目的是「看看模型回了什么」，这里优先保证回答可读。
-      _skipPlaceholder: true,
-    }, { skipEmptySystemPlaceholder: true });
+    });
   } catch (e) {
     return { model, ok: false, category: 'error', latencyMs: elapsed(), httpStatus: null, message: `构造请求失败: ${e.message}`, prompt };
   }
@@ -644,7 +651,8 @@ async function probeModel({ key, model, message, mode = 'single' }) {
       };
     }
 
-    const { text, reasoning, streamError, sawFinish, finishReason, usage } = await consumeProbeStream(response, { maxChars: limits.maxChars });
+    const { text, reasoning, streamError, sawFinish, finishReason, usage, upstreamModel, upstreamProvider } =
+      await consumeProbeStream(response, { maxChars: limits.maxChars });
 
     if (streamError) {
       const category = classifyProbe({ ok: false, bodyText: String(streamError) });
@@ -652,6 +660,8 @@ async function probeModel({ key, model, message, mode = 'single' }) {
         model, ok: false, category: category === 'error' ? 'error' : category,
         latencyMs: elapsed(), httpStatus: 200,
         message: summarizeUpstreamError(String(streamError), 200),
+        upstreamModel: upstreamModel || null,
+        upstreamProvider: upstreamProvider || null,
         prompt,
       };
     }
@@ -676,8 +686,17 @@ async function probeModel({ key, model, message, mode = 'single' }) {
         ? `链路正常（回答达到 token 上限被截断，上限 ${limits.maxTokens}）`
         : '链路正常（回答较长，仅显示前一段）';
     }
+    // 上游自报的 modelId 与请求的模型不一致时要说出来 —— 这是唯一能发现
+    // 「参数被中途改写/路由到别处」的信号（模型自述不算数）
+    const modelMatched = !upstreamModel || upstreamModel === model;
+    if (ok && !modelMatched) {
+      note += `；⚠️ 上游实际服务的是 ${upstreamModel}（与请求的 ${model} 不一致）`;
+    }
     return {
       model,
+      upstreamModel: upstreamModel || null,
+      upstreamProvider: upstreamProvider || null,
+      modelMatched,
       ok,
       category: ok ? 'ok' : 'error',
       latencyMs: elapsed(),
@@ -761,7 +780,7 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-function buildCcRequest(openaiReq, opts = {}) {
+function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
@@ -913,7 +932,7 @@ function buildCcRequest(openaiReq, opts = {}) {
   // 条件字段
   if (systemBlocks.length) {
     body.params.system = systemBlocks;
-  } else if (CFG.emptySystemPlaceholder && !opts.skipEmptySystemPlaceholder) {
+  } else if (CFG.emptySystemPlaceholder) {
     // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（进入
     // 默认上下文/前缀路径），既产生大量 cached tokens 又污染对话（模型会以为
     // 自己在 CC 的可执行目录里，见 issue #17）。发一个空格占位即可绕过，
