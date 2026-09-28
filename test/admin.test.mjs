@@ -582,6 +582,155 @@ test('设置接口可热改策略与默认模型，非法值被拒', async () =>
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
+// ── ⑩a 2API Key（下游客户端凭证）与上游 Key 的边界 ──────
+
+test('2API Key：签发后保护立即生效，且与上游 Key 各自独立', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+  });
+  const CHAT = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] };
+  try {
+    const api = await authed(proxy);
+
+    // 未签发前：透传模式，客户端带自己的上游 Key
+    const passthrough = await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${CATALOG_KEY}` });
+    assert.equal(passthrough.status, 200, '未签发 2API Key 时应是透传模式');
+    assert.equal(upstream.lastGenerate().headers.authorization, `Bearer ${CATALOG_KEY}`);
+
+    // 签发一个 2API Key（留空即自动生成）
+    const created = await api.post('/apikeys', { label: '测试客户端' });
+    assert.equal(created.status, 200);
+    const createdBody = await created.json();
+    const plain = createdBody.data.plainKey;
+    const id = createdBody.data.key.id;
+    assert.match(plain, /^ccp_/, '2API Key 用 ccp_ 前缀，与上游 user_ 一眼可分');
+    assert.equal(createdBody.data.generated, true);
+    assert.match(createdBody.message, /复制/);
+
+    // 保护立即生效（无需重启）
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT)).status, 401, '无凭证必须 401');
+
+    // 用 2API Key 调用 → 通过；上游拿到的是池里的 user_ Key，绝不是这个 2API Key
+    const viaApiKey = await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${plain}` });
+    assert.equal(viaApiKey.status, 200);
+    const sentAuth = upstream.lastGenerate().headers.authorization;
+    assert.equal(sentAuth, `Bearer ${CATALOG_KEY}`, '上游凭证应来自上游 Key 池');
+    assert.ok(!sentAuth.includes(plain), '2API Key 绝不能透传给上游');
+
+    // x-api-key 路径同样接受（Anthropic SDK 风格）
+    const viaXApiKey = await proxy.post('/v1/messages',
+      { model: 'claude-sonnet-5', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] },
+      { 'x-api-key': plain });
+    assert.equal(viaXApiKey.status, 200);
+
+    // 把上游 Key 当客户端凭证用 → 401，并明确告诉他该用哪个
+    const wrongKind = await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${CATALOG_KEY}` });
+    assert.equal(wrongKind.status, 401);
+    assert.match((await wrongKind.json()).error.message, /2API key/,
+      '误用上游 Key 时必须给出可操作的提示');
+
+    // 列表脱敏 + reveal
+    const listed = (await (await api.get('/apikeys')).json()).data;
+    const item = listed.keys.find(k => k.id === id);
+    assert.ok(!JSON.stringify(item).includes(plain), '列表里不能出现明文');
+    assert.match(item.keyMasked, /^ccp_/);
+    assert.equal(listed.counts.total, 1);
+    assert.equal((await (await api.post('/apikeys/reveal', { id })).json()).data.key, plain);
+
+    // 禁用 → 立即失效；且**不会**因此退回免鉴权（那是危险方向）
+    await api.post('/apikeys/update', { id, enabled: false });
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${plain}` })).status, 401);
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT)).status, 401,
+      '禁用最后一个 2API Key 不能变成免鉴权');
+
+    // 重新启用 → 恢复
+    await api.post('/apikeys/update', { id, enabled: true });
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${plain}` })).status, 200);
+
+    // 删光 → 回到透传模式（这是"关掉访问保护"的正规做法）
+    assert.equal((await api.post('/apikeys/delete', { id })).status, 200);
+    const back = await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${CATALOG_KEY}` });
+    assert.equal(back.status, 200, '删光 2API Key 后应回到透传模式');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('2API Key：前缀校验、重复校验、请求计数、与 proxyKey 并存', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true', PROXY_KEY: 'legacy-single-password' },
+  });
+  const CHAT = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] };
+  try {
+    const api = await authed(proxy);
+
+    // 自定义 Key 必须以 ccp_ 开头；把上游 Key 传进来要给出明确指引
+    const badPrefix = await api.post('/apikeys', { key: CATALOG_KEY });
+    assert.equal(badPrefix.status, 400);
+    const badPrefixBody = await badPrefix.json();
+    assert.match(badPrefixBody.error, /ccp_/);
+    assert.match(badPrefixBody.error, /上游/);
+
+    const tooShort = await api.post('/apikeys', { key: 'ccp_x' });
+    assert.equal(tooShort.status, 400);
+
+    // 正常自定义
+    const custom = 'ccp_custom0000000000000000000000';
+    const okCreate = await api.post('/apikeys', { key: custom, label: '自定义' });
+    assert.equal(okCreate.status, 200);
+    assert.equal((await okCreate.json()).data.generated, false);
+
+    // 重复
+    const dup = await api.post('/apikeys', { key: custom });
+    assert.equal(dup.status, 400);
+    assert.match((await dup.json()).error, /已存在/);
+
+    // 旧 proxyKey 仍然可用（兼容已部署配置）
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer legacy-single-password' })).status, 200);
+    // 2API Key 也可以用
+    assert.equal((await proxy.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${custom}` })).status, 200);
+
+    // 请求计数与最后使用时间
+    const listed = (await (await api.get('/apikeys')).json()).data;
+    const item = listed.keys.find(k => k.label === '自定义');
+    assert.ok(item.requests >= 1, `应记录请求数，实际 ${item.requests}`);
+    assert.ok(item.lastUsedAt, '应记录最后使用时间');
+    assert.equal(listed.proxyKeySet, true, '应告知前端还有 proxyKey 存在');
+    assert.equal(listed.protectionEnabled, true);
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('2API Key 持久化：重启后仍然有效', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-apikeys-'));
+  seedConfig(workdir);
+  const upstream = await startCatalogUpstream();
+  const env = { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' };
+  const CHAT = { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] };
+
+  let plain;
+  const proxy1 = await startProxy({ upstreamPort: upstream.port, env, cwd: workdir });
+  try {
+    const api = await authed(proxy1);
+    const created = await api.post('/apikeys', { label: '长期客户端' });
+    plain = (await created.json()).data.plainKey;
+  } finally { await proxy1.kill(); }
+
+  assert.ok(existsSync(join(workdir, 'data', 'api-keys.json')), '2API Key 应单独落盘 api-keys.json');
+
+  const proxy2 = await startProxy({ upstreamPort: upstream.port, env, cwd: workdir });
+  try {
+    assert.equal((await proxy2.post('/v1/chat/completions', CHAT, { Authorization: `Bearer ${plain}` })).status, 200,
+      '重启后该 2API Key 仍应可用');
+    assert.equal((await proxy2.post('/v1/chat/completions', CHAT)).status, 401, '重启后保护仍在');
+  } finally {
+    await proxy2.kill();
+    await upstream.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 // ── ⑩b 模型启用/禁用 ────────────────────────────────
 
 test('模型启用/禁用：列表带状态、单条与批量切换、全选、参数校验', async () => {

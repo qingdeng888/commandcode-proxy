@@ -144,41 +144,69 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
 
-## 访问保护
+## 两套 Key：上游 Key 与 2API Key
 
-默认情况下代理**不做访问控制**：客户端在 `Authorization: Bearer <key>` 中携带自己的 `user_` Key，代理原样透传给上游。**监听 `0.0.0.0` 时任何人都能借用这套代理**。
+这两套 Key **完全不同**，是接入时最容易搞混的地方，先说清楚：
 
-在 `config.json` 中填入 `proxyKey` 即启用**严格模式**，把「客户端凭证」与「上游凭证」彻底分离：
+| | 🔑 上游 Key | 🔐 2API Key |
+|---|---|---|
+| **是什么** | Command Code 账号 Key（`user_` 开头）| 本项目自己签发的 Key（`ccp_` 开头）|
+| **谁用它** | **服务端自己**：代理拿它去调用 Command Code | **下游客户端**：别人拿它来调用本代理 |
+| **能给别人吗** | <span>绝对不要</span> —— 等于把账号送人 | 可以，本来就是发出去的 |
+| **在哪管理** | 后台「🔑 上游 Key」页 | 后台「🔐 2API Key」页 |
+| **存储** | `data/keys.json` | `data/api-keys.json` |
+| **来源** | 后台添加 / `config.json` 的 `apiKey` / `CC_API_KEY` | 只能在后台签发 |
 
-```json
-{
-  "proxyKey": "your-proxy-key",
-  "apiKey": ["user_你的Key1", "user_你的Key2"]
-}
+一次请求的完整链路：
+
+```
+下游客户端 --(2API Key)--> 本代理 --(按策略挑一个上游 Key)--> Command Code
 ```
 
-| | 未启用（`proxyKey` 为空） | 启用后 |
-|---|---|---|
-| 客户端凭证 | 自己的 `user_` Key，透传上游 | 只需 `proxyKey` |
-| 上游凭证 | 来自客户端 | 从 `apiKey` 列表随机选取，客户端无法覆盖 |
-| `/v1/models` | 无凭证也返回（静态列表） | 同样要求 `proxyKey` |
+**为什么要分开**：上游 Key 一旦泄露只能整个换号；2API Key 可以按客户端逐个签发，
+某个客户端泄露只吊销它自己，不影响别人。混用会让「谁能调用」和「用谁的账号」纠缠不清。
+
+### 访问保护
+
+三种状态：
+
+| 状态 | 判据 | 客户端要带什么 | 上游用谁的 Key |
+|---|---|---|---|
+| **透传模式**（默认）| 没签发过 2API Key，也没设 `proxyKey` | 自己的上游 `user_` Key | 客户端的 |
+| **2API Key**（推荐）| 签发过任意 2API Key | `ccp_...`（逐个签发/吊销）| 池里按策略挑，客户端拿不到 |
+| **proxyKey**（旧配置）| `config.json` 里设了 `proxyKey` | 那个单口令 | 池里按策略挑 |
+
+> ⚠️ 判据是「**签发过**」而不是「启用中」。否则把最后一个 2API Key 禁用就会静默退回透传模式 ——
+> 等于关掉访问控制，这个方向太危险，所以宁可一律 401 也不放行。要关闭保护，把 2API Key **全部删光**。
+
+**透传模式**下不做访问控制，客户端在 `Authorization: Bearer <user_...>` 里带自己的上游 Key。
+⚠️ 监听 `0.0.0.0` 时这意味着**任何能访问到本端口的人都能借用这套代理**（用他自己的 Key）。
+
+**想限制访问**，最省事的做法是在后台「🔐 2API Key」页点一下「🎲 生成并添加」——
+签发后保护**立即生效，无需重启**：
+
+```bash
+# 客户端这样调用（ccp_ 开头的是 2API Key，不是上游 Key）
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Authorization: Bearer ccp_xxxxxxxx_xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+> 下游面板（new-api / one-api 等）把「调用本代理的 Key」填成签发出来的 2API Key 即可，
+> 上游 `user_` Key 始终留在本机、不外泄。
 
 鉴权失败响应：
 
 | 场景 | 状态码 | 消息 |
 |------|--------|------|
 | 未带凭证 | `401` | `Missing API key. Send in Authorization: Bearer <key> or x-api-key header` |
-| 凭证错误 | `401` | `Invalid API key` |
-| `apiKey` 未配置 | `500` | `Server upstream API key not configured` |
+| 凭证错误 / 已禁用 | `401` | `Invalid API key` |
+| **误把上游 Key 当客户端凭证** | `401` | `This proxy requires a 2API key issued in the admin panel…` |
+| 上游 Key 池为空 | `500` | `Server upstream API key not configured` |
 
-```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
-  -H "Authorization: Bearer your-proxy-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
-```
-
-> 下游面板（new-api / one-api 等）只需把调用本代理的 Key 填为 `proxyKey` 的值，上游 `user_` Key 留在本机不外泄。
+最后一条是特意加的：把上游 Key 发给了下游是最常见的误用，直接告诉他该用哪个，
+比笼统回一句 `Invalid API key` 有用得多。
 
 ### 多 Key 轮询
 
@@ -257,13 +285,14 @@ ADMIN_PASSWORD=你的管理密码 npm start
 | 页面 | 内容 |
 |------|------|
 | 📊 仪表盘 | Key / 模型 / 请求 / Token 统计，上游连通性测试 |
-| 🔑 Key 管理 | 增删改查、启停、👁 揭示明文、⚡ 真实探测、从 `config`/`env` 导入、切换轮询策略 |
+| 🔐 **2API Key** | 签发给**下游客户端**的调用凭证：生成 / 逐个吊销 / 启停 / 揭示明文 / 请求计数；页面顶部直接说明「两套 Key 的区别」|
+| 🔑 **上游 Key** | Command Code 账号凭证（`user_`）：增删改查、启停、👁 揭示明文、⚡ 真实探测、从 `config`/`env` 导入、切换轮询策略 |
 | 🧠 模型 | 上游模型目录（含上下文长度与支持的端点）、单模型测试、批量测试（受限并发 + 可取消）|
 | 📈 用量 | 按 Key 的请求数 / 失败数 / Token（今日与累计），可重置 |
 | 📜 请求日志 | **SSE 实时推送**（非轮询），可暂停、清屏、按级别过滤 |
 | ⚙️ 设置 | 运行配置热更新、修改后台密码 |
 
-### Key 的三种来源
+### 上游 Key 的三种来源
 
 | 来源 | 存储 | 可否编辑 |
 |------|------|----------|
@@ -395,10 +424,15 @@ ADMIN_PASSWORD=你的管理密码 npm start
 
 | 文件 | 内容 | 权限 |
 |------|------|------|
-| `data/keys.json` | 后台添加的上游 Key（**明文**）| 600 |
+| `data/keys.json` | **上游 Key**（Command Code 账号凭证，**明文**）| 600 |
+| `data/api-keys.json` | **2API Key**（签发给下游客户端的凭证，**明文**）| 600 |
 | `data/settings.json` | 后台改过的设置（稀疏覆盖）| 600 |
-| `data/.admin-auth.json` | 后台密码的 scrypt 哈希 | 600 |
+| `data/.admin-auth.json` | **后台密码**的 scrypt 哈希 | 600 |
+| `data/models.json` | 被禁用的模型 id（稀疏集合）| 600 |
 | `data/model-tests.json` | 最近一次批量模型测试结果 | 600 |
+
+> 三个不同的「密码/Key」别搞混：`data/keys.json` 是**上游账号**凭证、
+> `data/api-keys.json` 是**下游调用**凭证、`data/.admin-auth.json` 是**打开面板**的口令。
 
 用 `CC_DATA_DIR` 可改目录。**Docker 部署必须把这个目录挂出来**，否则容器重建后后台配置全部丢失。
 

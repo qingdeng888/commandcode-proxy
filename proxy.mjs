@@ -21,6 +21,7 @@ import { CFG, startConfigWatcher } from './lib/config.mjs';
 import { DATA_DIR } from './lib/store.mjs';
 import { createLogBus, levelEnabled } from './lib/logbus.mjs';
 import { createKeyPool } from './lib/keys.mjs';
+import { createApiKeyPool, looksLikeUpstreamKey } from './lib/api-keys.mjs';
 import { createAdminAuth } from './lib/admin-auth.mjs';
 import { createModelCatalog, createModelTestRunner, classifyProbe } from './lib/models.mjs';
 import { createModelState } from './lib/model-state.mjs';
@@ -34,7 +35,10 @@ const logBus = createLogBus();
 // Key 池：视 UI Key + config/env Key 为一个轮询池
 const keyPool = createKeyPool({ log: (...args) => log(...args) });
 
-// 后台鉴权（与数据面的 proxyKey 是两套独立凭证）
+// 2API Key：本项目自己签发给**下游客户端**的凭证（与上游 Key 完全两套东西，见 lib/api-keys.mjs）
+const apiKeyPool = createApiKeyPool({ log: (...args) => log(...args) });
+
+// 后台鉴权（与数据面的凭证体系又是另一套：它管的是「谁能打开面板」）
 const adminAuth = createAdminAuth({ log: (...args) => log(...args) });
 
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
@@ -1337,6 +1341,11 @@ const AUTH_ERR_MSG = {
   missing: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header',
   invalid: 'Invalid API key',
   upstream_unconfigured: 'Server upstream API key not configured',
+  // 这条是特意加的：把上游 Key 当成本代理的 Key 用是最常见的误用，
+  // 直接说清楚「该用哪个」，比笼统回一句 Invalid API key 有用得多
+  client_key_expected:
+    'This proxy requires a 2API key issued in the admin panel (/admin/ → 2API Key). '
+    + 'Upstream user_ keys are server-side credentials and must not be used by clients.',
 };
 
 // ── 上游 Key 选择（多 Key 轮询）──────────────────────
@@ -1354,17 +1363,47 @@ function pickUpstreamKey(exclude) {
 // 鉴权入口：成功返回 { upstreamKey }，失败返回 { error }
 // - proxyKey 非空 → 严格模式：客户端只认 proxyKey，上游凭证从 Key 池按策略选取（不再透传）
 // - proxyKey 为空 → 保护未启用，沿用旧的透传行为
+// 鉴权入口：成功返回 { upstreamKey, clientKeyId? }，失败返回 { error }
+//
+// 这里把两套 Key 的职责分清楚：
+//   进来的凭证 → 本代理签发的 2API Key（或兼容旧的单口令 proxyKey）
+//   出去的凭证 → 上游 Key 池里按策略挑一个（客户端永远拿不到它）
+//
+// 严格模式在「签发了任何 2API Key」或「设置了 proxyKey」时启用。
+// 注意用 size 而不是「启用数量」：若按启用数量判断，把最后一个 Key 禁用就会
+// 静默退回透传模式 —— 等于关掉访问控制，这个方向错得太危险（宁可失败也不放行）。
 function authenticate(headers) {
-  if (!CFG.proxyKey) {
+  const strictMode = apiKeyPool.size > 0 || !!CFG.proxyKey;
+
+  if (!strictMode) {
+    // 保护未启用：沿用旧的透传行为，客户端带自己的上游 Key
     const key = getApiKey(headers);
     return key ? { upstreamKey: key } : { error: 'missing' };
   }
+
   const cred = extractCredential(headers);
   if (!cred) return { error: 'missing' };
-  if (!safeEqual(cred, CFG.proxyKey)) return { error: 'invalid' };
-  const picked = keyPool.pick();
-  if (!picked) return { error: 'upstream_unconfigured' };
-  return { upstreamKey: picked.key };
+
+  // ① 本代理签发的 2API Key
+  const entry = apiKeyPool.verify(cred);
+  if (entry) {
+    const picked = keyPool.pick();
+    if (!picked) return { error: 'upstream_unconfigured' };
+    apiKeyPool.recordUse(entry);
+    return { upstreamKey: picked.key, clientKeyId: entry.id, clientKeyLabel: entry.label || '' };
+  }
+
+  // ② 兼容旧的单口令 proxyKey（没有按客户端区分/吊销的能力，但已部署的配置不该失效）
+  if (CFG.proxyKey && safeEqual(cred, CFG.proxyKey)) {
+    const picked = keyPool.pick();
+    if (!picked) return { error: 'upstream_unconfigured' };
+    return { upstreamKey: picked.key, clientKeyId: null };
+  }
+
+  // ③ 拿了上游 Key 来当客户端凭证：明确告诉他该用哪个
+  if (looksLikeUpstreamKey(cred)) return { error: 'client_key_expected' };
+
+  return { error: 'invalid' };
 }
 
 // 统一的鉴权失败响应；Anthropic 端点的错误结构不同
@@ -3766,6 +3805,7 @@ function handleHealth(req, res) {
 const adminApi = createAdminApi({
   auth: adminAuth,
   pool: keyPool,
+  apiKeys: apiKeyPool,
   catalog,
   modelState,
   runner: modelTestRunner,
@@ -3894,7 +3934,7 @@ server.listen(CFG.port, CFG.host, () => {
     url: `http://${CFG.host}:${CFG.port}`,
     admin: `http://${CFG.host}:${CFG.port}/admin/`,
     api: CFG.apiBase,
-    keys: `${keyState.total} 个（启用 ${keyState.enabled}）`,
+    keys: `上游 ${keyState.total} 个（启用 ${keyState.enabled}）· 2API ${apiKeyPool.size} 个`,
     strategy: CFG.strategy,
     session: '12h + 1h jitter, per API key',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
@@ -3922,18 +3962,27 @@ server.listen(CFG.port, CFG.host, () => {
     });
   }
 
-  if (CFG.proxyKey) {
-    if (keyState.enabled > 0) {
-      log('info', '访问保护已启用：客户端用 proxyKey 鉴权，上游 Key 按策略轮询', {
-        upstreamKeys: keyState.enabled,
-        strategy: CFG.strategy,
-        maxAttemptsPerRequest: Math.min(Math.max(keyState.enabled, 1), MAX_KEY_ATTEMPTS),
-      });
-    } else {
-      log('warn', 'proxyKey is set but no upstream key configured. All API requests will fail with 500 until at least one user_ key is added (后台 /admin/ 或 config.json / CC_API_KEY).');
+  // 把两套 Key 的分工在启动横幅里说清楚 —— 这是最容易搞混的地方
+  const clientEnabled = apiKeyPool.countEnabled();
+  const clientTotal = apiKeyPool.size;
+  const strictMode = clientTotal > 0 || !!CFG.proxyKey;
+
+  if (strictMode) {
+    log('info', '访问保护已启用（2API Key 归下游，上游 Key 归服务端）', {
+      客户端凭证: clientTotal > 0
+        ? `2API Key：${clientEnabled} 个启用 / ${clientTotal} 个已签发（在 /admin/ 的「2API Key」页管理）`
+        : 'proxyKey：单口令（旧配置兼容）',
+      上游凭证: `上游 Key：${keyState.enabled} 个启用，按 ${CFG.strategy} 轮询`,
+      单请求最多换: Math.min(Math.max(keyState.enabled, 1), MAX_KEY_ATTEMPTS) + ' 个上游 Key',
+    });
+    if (keyState.enabled === 0) {
+      log('warn', '上游 Key 池为空：所有 API 请求都会返回 500，请到 /admin/ 的「上游 Key」页添加 Command Code Key（user_ 开头）');
     }
-  } else if (keyState.enabled === 0) {
-    log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
+    if (clientTotal > 0 && clientEnabled === 0) {
+      log('warn', '所有 2API Key 都被禁用：所有客户端请求都会返回 401（不会因此退回免鉴权模式）');
+    }
+  } else {
+    log('warn', '访问保护未启用：任何能访问到本端口的人都可以借这套代理调用（用他自己的上游 Key）。要限制访问，请在 /admin/ 的「2API Key」页签发一个 Key。');
   }
 
   // 后台可用性提示：未设密码时后台整体拒绝访问（不是「无密码可进」）

@@ -9,6 +9,35 @@
   未登录访问受保护接口 → **401**，并返回下面「错误信封」的 `auth_error` 形式。
   前端收到 401 必须跳回登录视图。
 
+## 两套 Key（务必分清）
+
+本项目有**两套完全不同的 Key**，接口路径也刻意分开，不要混用：
+
+| | 上游 Key | 2API Key |
+|---|---|---|
+| 是什么 | Command Code 账号 Key（`user_` 开头）| 本项目自己签发的 Key（`ccp_` 开头）|
+| 谁用 | **服务端自己**：代理拿它去调用 Command Code | **下游客户端**：别人拿它来调用本代理 |
+| 能给别人吗 | 绝不 —— 等于把账号送人 | 可以，本来就是发出去的 |
+| 管理路径 | `/admin/api/keys*` | `/admin/api/apikeys*` |
+| 存储 | `data/keys.json` | `data/api-keys.json` |
+| 后台页面 | 🔑 上游 Key | 🔐 2API Key |
+| 来源 | `ui` / `config` / `env` 三种 | 只能在后台签发 |
+
+一次请求的链路：
+
+```
+下游客户端 --(2API Key)--> 本代理 --(按策略挑一个上游 Key)--> Command Code
+```
+
+**为什么要分开**：上游 Key 泄露只能整个换号；2API Key 可以按客户端逐个签发，
+某个客户端泄露只吊销它自己。混用会让「谁能调用」和「用谁的账号」纠缠不清。
+
+**访问保护何时启用**：只要**签发过任何 2API Key**（不论是否启用）或设置了 `proxyKey`，
+就要求客户端提供凭证。两者都没有时是**透传模式** —— 客户端带自己的上游 Key。
+
+> ⚠️ 判据是「签发过」而不是「启用中」：否则把最后一个 Key 禁用就会静默退回透传模式，
+> 等于关掉访问控制 —— 这个方向太危险，宁可失败也不放行。
+
 ## 统一响应信封
 
 成功：
@@ -74,7 +103,45 @@
 } }
 ```
 
-## Key 管理
+## 2API Key（下游客户端凭证）
+
+列表项：
+
+```json
+{
+  "id": "ak_1759000000000_ab12",
+  "label": "给朋友",
+  "keyMasked": "ccp_1a0e78…901b",
+  "enabled": true,
+  "createdAt": "2026-09-28T09:00:00.000Z",
+  "lastUsedAt": "2026-09-28T09:10:00.000Z",
+  "requests": 42
+}
+```
+
+| 接口 | 方法 | 说明 |
+|---|---|---|
+| `/admin/api/apikeys` | GET | `{success,data:{keys,counts:{total,enabled},proxyKeySet,protectionEnabled}}` |
+| `/admin/api/apikeys` | POST | 签发。请求 `{label?, key?}`；`key` 留空则自动生成 |
+| `/admin/api/apikeys/update` | POST | `{id,label?,enabled?}` |
+| `/admin/api/apikeys/delete` | POST | `{id}` |
+| `/admin/api/apikeys/reveal` | POST | `{id}` → `{success,data:{key:"ccp_..."}}` |
+
+**创建响应会把明文放在 `data.plainKey`**（`data.key` 是不含明文的列表项）：
+明文只在创建这一次返回，列表始终脱敏，之后要看只能走 `reveal`。
+`data.generated` 表示是否为系统自动生成。
+
+校验：自定义 `key` 必须以 `ccp_` 开头，否则 400
+（错误信息会明确指向「上游 user_ Key 请到上游 Key 页添加」）；长度不足 12 → 400；
+重复 → 400 `该 2API Key 已存在`。
+
+**禁用后立即失效**，且不会因此退回免鉴权（仍返回 401）。删除同理。
+把 2API Key **全部删光**才是「关闭访问保护」的正规做法（回到透传模式）。
+
+客户端提交凭证的方式（与数据面一致）：`Authorization: Bearer <ccp_...>` 或 `x-api-key: <ccp_...>`。
+若客户端误把上游 `user_` Key 当成本代理的凭证提交，会返回 401 并明确提示应使用 2API Key。
+
+## 上游 Key 管理
 
 Key 列表项（下称 `KeyItem`）：
 

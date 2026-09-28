@@ -8,7 +8,8 @@ const router = useRouter()
 
 const NAV = [
   { name: 'dashboard', icon: '📊', title: '仪表盘' },
-  { name: 'keys', icon: '🔑', title: 'Key 管理' },
+  { name: 'apiKeys', icon: '🔐', title: '2API Key' },
+  { name: 'keys', icon: '🔑', title: '上游 Key' },
   { name: 'models', icon: '🧠', title: '模型' },
   { name: 'usage', icon: '📈', title: '用量' },
   { name: 'logs', icon: '📜', title: '请求日志' },

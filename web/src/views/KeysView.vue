@@ -286,13 +286,23 @@ onUnmounted(() => {
 <template>
   <div>
     <h2>
-      🔑 Key 管理
-      <span class="probe-pill">config / env 来源的 Key 只读，需先「导入」才能在后台管理</span>
+      🔑 上游 Key
+      <span class="probe-pill">Command Code 账号凭证（user_ 开头）· 这是服务端拿去调用上游用的</span>
       <button class="btn btn-sm" style="margin-left: auto" type="button" :disabled="keysState.loading" @click="loadKeys(true)">
         <span v-if="keysState.loading" class="loading"></span>
         {{ keysState.loading ? '加载中…' : '🔄 刷新' }}
       </button>
     </h2>
+
+    <div class="result-box" style="border-color: rgba(34,211,238,.35)">
+      <div class="title text-accent">🔑 这是「上游 Key」，不是给客户端用的 Key</div>
+      <div class="hint">
+        这里的 Key 是 <strong>Command Code 账号凭证</strong>（<code>user_</code> 开头），
+        本代理拿它去调用上游。<strong>绝对不要发给下游客户端</strong> —— 那等于把账号送人。<br />
+        给下游客户端用的凭证请到 <router-link to="/api-keys">🔐 2API Key</router-link> 页签发
+        （<code>ccp_</code> 开头，可逐个吊销）。
+      </div>
+    </div>
 
     <div class="section">
       <div class="section-title">

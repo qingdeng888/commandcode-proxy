@@ -164,6 +164,64 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
+## Two kinds of key: upstream vs 2API
+
+These are **completely different** and the most common source of confusion:
+
+| | 🔑 Upstream Key | 🔐 2API Key |
+|---|---|---|
+| **What** | Command Code account key (`user_…`) | A key this proxy issues (`ccp_…`) |
+| **Who uses it** | **The server itself** — the proxy calls Command Code with it | **Downstream clients** — they call this proxy with it |
+| **Share it?** | Never — that hands over your account | Yes, it exists to be handed out |
+| **Managed where** | Panel → 🔑 Upstream Key | Panel → 🔐 2API Key |
+| **Stored in** | `data/keys.json` | `data/api-keys.json` |
+| **Comes from** | panel / `config.json` `apiKey` / `CC_API_KEY` | issued in the panel only |
+
+The full path of one request:
+
+```
+downstream client --(2API Key)--> this proxy --(one upstream Key, by strategy)--> Command Code
+```
+
+**Why separate them**: a leaked upstream key means replacing the whole account, while a 2API key can
+be issued per client so a leak only revokes that one client. Mixing them tangles "who may call" with
+"whose account pays".
+
+### Access control
+
+| Mode | Condition | Client sends | Upstream key used |
+|------|-----------|--------------|-------------------|
+| **Pass-through** (default) | no 2API key ever issued, no `proxyKey` | its own `user_` key | the client's |
+| **2API Key** (recommended) | any 2API key issued | `ccp_…` (issue/revoke per client) | picked from the pool; the client never sees it |
+| **proxyKey** (legacy) | `proxyKey` set in `config.json` | that single password | picked from the pool |
+
+> ⚠️ The trigger is "**ever issued**", not "currently enabled". Otherwise disabling the last 2API key
+> would silently fall back to pass-through — i.e. turn access control *off*. That direction is too
+> dangerous, so the proxy fails closed with 401 instead. To disable protection, delete **all** 2API keys.
+
+The quickest way to require credentials: open Panel → 🔐 2API Key → **🎲 生成并添加**.
+Protection takes effect **immediately, no restart**:
+
+```bash
+# clients call like this (ccp_… is a 2API key, not an upstream key)
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Authorization: Bearer ccp_xxxxxxxx_xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Auth failures:
+
+| Case | Status | Message |
+|------|--------|---------|
+| No credential | `401` | `Missing API key. Send in Authorization: Bearer <key> or x-api-key header` |
+| Wrong / disabled credential | `401` | `Invalid API key` |
+| **Upstream key used as a client credential** | `401` | `This proxy requires a 2API key issued in the admin panel…` |
+| Upstream key pool empty | `500` | `Server upstream API key not configured` |
+
+The third row is deliberate: handing an upstream key to a client is the classic mistake, and naming
+the right credential is far more useful than a bare `Invalid API key`.
+
 ## Web Admin Panel
 
 Open `http://<host>:<port>/admin/` to manage keys, models and settings. **Every change takes
@@ -197,7 +255,8 @@ ADMIN_PASSWORD=your-admin-password npm start
 | Page | Contents |
 |------|----------|
 | 📊 Dashboard | Key / model / request / token stats, upstream connectivity test |
-| 🔑 Keys | Add, edit, delete, enable/disable, 👁 reveal, ⚡ real probe, import from `config`/`env`, rotation strategy |
+| 🔐 **2API Keys** | Calling credentials issued to **downstream clients**: generate, revoke individually, enable/disable, reveal, per-key request counts. The page opens with a "differences between the two key types" table |
+| 🔑 **Upstream Keys** | Command Code account credentials (`user_`): add/edit/delete, enable/disable, 👁 reveal, ⚡ real probe, import from `config`/`env`, rotation strategy |
 | 🧠 Models | Upstream catalog (context length + supported endpoints), single-model test, batch test (limited concurrency, cancellable) |
 | 📈 Usage | Per-key requests / failures / tokens (today and total), resettable |
 | 📜 Request Log | **SSE live stream** (not polling) with pause, clear and level filter |
@@ -327,10 +386,16 @@ Hand-editing `config.json` also hot-reloads (mtime polled every 3 s — more por
 
 | File | Contents | Mode |
 |------|----------|------|
-| `data/keys.json` | Panel-managed upstream keys (**plaintext**) | 600 |
+| `data/keys.json` | **Upstream keys** (Command Code account credentials, **plaintext**) | 600 |
+| `data/api-keys.json` | **2API keys** (credentials issued to downstream clients, **plaintext**) | 600 |
 | `data/settings.json` | Settings changed from the panel (sparse overlay) | 600 |
-| `data/.admin-auth.json` | scrypt hash of the admin password | 600 |
+| `data/.admin-auth.json` | scrypt hash of the **admin panel** password | 600 |
+| `data/models.json` | Disabled model ids (sparse set) | 600 |
 | `data/model-tests.json` | Results of the last batch test | 600 |
+
+> Three different secrets, easily confused: `data/keys.json` is the **upstream account**
+> credential, `data/api-keys.json` is the **downstream client** credential, and
+> `data/.admin-auth.json` is the **panel login** password.
 
 Change the location with `CC_DATA_DIR`. **Docker deployments must mount this directory**, or the
 panel configuration is lost when the container is recreated.

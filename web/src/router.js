@@ -4,6 +4,7 @@ import AdminLayout from './components/AdminLayout.vue'
 import LoginView from './views/LoginView.vue'
 import DashboardView from './views/DashboardView.vue'
 import KeysView from './views/KeysView.vue'
+import ApiKeysView from './views/ApiKeysView.vue'
 import ModelsView from './views/ModelsView.vue'
 import UsageView from './views/UsageView.vue'
 import LogsView from './views/LogsView.vue'
@@ -23,7 +24,9 @@ const routes = [
     children: [
       { path: '', redirect: { name: 'dashboard' } },
       { path: 'dashboard', name: 'dashboard', component: DashboardView, meta: { title: '仪表盘' } },
-      { path: 'keys', name: 'keys', component: KeysView, meta: { title: 'Key 管理' } },
+      // 两套 Key 分成两个页面：上游 Key 是服务端凭证，2API Key 是签发给下游的凭证
+      { path: 'api-keys', name: 'apiKeys', component: ApiKeysView, meta: { title: '2API Key' } },
+      { path: 'keys', name: 'keys', component: KeysView, meta: { title: '上游 Key' } },
       { path: 'models', name: 'models', component: ModelsView, meta: { title: '模型' } },
       { path: 'usage', name: 'usage', component: UsageView, meta: { title: '用量' } },
       { path: 'logs', name: 'logs', component: LogsView, meta: { title: '请求日志' } },
