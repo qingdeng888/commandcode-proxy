@@ -11,6 +11,7 @@
     "test": "node --test test/*.test.mjs",
     "build:web": "npm --prefix web install --no-audit --no-fund && npm --prefix web run build",
     "dev:web": "npm --prefix web run dev",
+    "test:bun": "bun test",
     "docker:build": "docker build -t commandcode-proxy:latest .",
     "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest ."
   },
