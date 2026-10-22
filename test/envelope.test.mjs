@@ -1,8 +1,11 @@
 // 信封与请求头契约：断言 /alpha/generate 的**键序**与 header 集合。
-// 依据官方 CLI 源码（command-code@1.54.0 dist/cli.mjs，未混淆）：
+// 依据官方 CLI 源码（command-code@1.54.0 引入，1.87.1 dist/cli.mjs 复核未变，未混淆）：
 //   buildCommandAuthHeaders(e) → { 'Content-Type', 'User-Agent': "cli", [CLI_VERSION],
 //     [CLI_ENVIRONMENT], [PROJECT_SLUG], [TASTE_LEARNING], [SESSION_ID], Authorization, ... }
-//   常量表 Sy 共 10 项，**没有 x-co-flag**。
+//   1.87.1 的常量表新增 x-cli-surface / x-oss-primary-provider /
+//   x-cmd-provider-deepseek-internal，三者都只在非普通会话才发（acp/rpc 入口、BYOK、
+//   内部账号），普通会话一个都不发 —— 见 test/protocol-1.87.test.mjs 的头部用例。
+//   仍然**没有 x-co-flag**。
 //   信封键序：config, memory, taste, skills, permissionMode, threadId, mode, params。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

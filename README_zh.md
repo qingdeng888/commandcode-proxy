@@ -4,7 +4,7 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
-逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
+逐条对齐官方 npm 包源码（`command-code@1.87.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出防护（非流式 429 / 流式 response.failed）| 连续超时 → 429 自动重试 | 隐私保护日志
 
@@ -966,7 +966,9 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
 | **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`），与生成请求共用 `User-Agent: cli` |
 | **Session ID** | 客户端带了 session 类 header 时直接用（`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`）；否则**按请求内容确定性派生** —— `sha1(apiKey + model + system + 首个非 user 消息之前的连续 user 文本)` 格式化成 UUID。|
-| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.87.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **普通会话的头集合** | 1.87.1 里只有非普通会话才发的三个头一个都不发：`x-cli-surface`（acp/rpc 入口）、`x-oss-primary-provider`（BYOK）、`x-cmd-provider-deepseek-internal`（内部账号）。早已消失的 `x-co-flag` 同样不发 |
+| **出网 JSON 干净** | 孤立的 UTF-16 半代理项（客户端截断 emoji 的产物）在**唯一**的 `JSON.stringify` 调用点用 replacer 清掉，三种协议与所有字段一次覆盖。成对代理项（真实 emoji）原样保留 —— 否则 `JSON.stringify` 会写出 `\ud83d`，严格的上游解码器直接 400 |
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
@@ -1265,6 +1267,36 @@ CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
 
 > **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
 > `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
+
+## 输出上限与额度类错误
+
+两件事看起来都像「上游报错」，处置方向却相反，这里分开说清楚。
+
+**输出上限（`max_tokens`）是请求维度，不该换 Key，但值得降档重发。** 上游拒绝时会把**真实上限**
+写进错误正文：
+
+```
+400 max_tokens: 200000 > 128000, which is the maximum allowed number of output tokens for claude-sonnet-5-5
+```
+
+代理从这条比较句里解析出 `128000`，把它记进进程级的 `learnedOutputCeilings`（只收紧、不放大），
+夹住 `max_tokens` 后**重发一次同一请求**。命中之后，同一模型的后续请求在构造阶段就被预先夹住，
+不必每个请求都白吃一次 400。
+
+- 只认带数字的比较式。只报 `Invalid input: expected number ... at max_tokens` 而不给数字时不猜 ——
+  猜出来的值在后续请求里与真实上限无从区分，比直接失败更糟。
+- 只降档一次。第二次仍被拒就是别的原因，继续重试只是白烧额度。
+- 目录公布的上限（`max_output_tokens`）与学到的值取小，并且还要夹住网关硬上限 `200000`
+  （实测 200000 被接受、200704 被拒，与模型窗口无关）。
+
+**额度类错误是账号维度，必须换 Key。** `INSUFFICIENT_CREDITS` / `USAGE_EXCEEDED` /
+`PREMIUM_CREDITS_EXHAUSTED` / `402 insufficient credits` 都表示「这个账号没钱了」，池里别的
+Key 明明还能用 —— 所以它们**不**进「与 Key 无关」的名单（那份名单只留模型维度的
+`MODEL_NOT_IN_PLAN` / `model not in plan`）。判据上刻意做了大小写与下划线/空格的归一，
+因为上游 JSON 里写 `MODEL_NOT_IN_PLAN`、错误正文里写 `model not in plan`。
+
+> 把额度类当成「与 Key 无关」是多 Key 部署里代价最高的一个误判：整池 Key 会因为第一个
+> 没钱的账号而全部失败，而正确处置只需要换下一个。
 
 ## 内存与部署
 

@@ -942,14 +942,16 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
+Aligned line-by-line against the official npm package source (`command-code@1.87.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init, using the same `User-Agent: cli` as generate |
 | **Session ID** | Taken from the client header when present (`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`); otherwise **derived deterministically from the request** — `sha1(apiKey + model + system + user text up to the first non-user message)` formatted as a UUID. |
-| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.87.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **Ordinary-session header set** | The three headers 1.87.1 only sends outside a plain session — `x-cli-surface` (acp/rpc front doors), `x-oss-primary-provider` (BYOK), `x-cmd-provider-deepseek-internal` (internal accounts) — are never sent. Same for the long-gone `x-co-flag` |
+| **Clean outgoing JSON** | Lone UTF-16 surrogate halves (a truncated emoji, produced by client-side slicing) are stripped at the single `JSON.stringify` call site via a replacer, so all three protocols are covered. Paired surrogates — every real emoji — survive untouched; `JSON.stringify` would otherwise emit `\ud83d` and a strict upstream decoder would 400 |
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |
@@ -1230,6 +1232,37 @@ CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
 > **Scope**: the retry loop covers both the streaming and non-streaming paths of `/v1/chat/completions`.
 > `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
 > reported as before).
+
+## Output Ceilings and Credit Errors
+
+Both look like "the upstream rejected us", but they call for opposite handling.
+
+**An output ceiling is a request-side problem: never switch keys, but do refit and resend once.** The rejection states
+the real ceiling in the body:
+
+```
+400 max_tokens: 200000 > 128000, which is the maximum allowed number of output tokens for claude-sonnet-5-5
+```
+
+The proxy parses `128000` out of that comparison, records it in a process-wide `learnedOutputCeilings` map (tighten
+only, never widen), clamps `max_tokens`, and resends the same request **once**. Later requests for that model are
+clamped while the body is built, so the 400 is not paid again every turn.
+
+- Only the numeric comparison form is parsed. A message such as `Invalid input: expected number ... at max_tokens`
+  names no ceiling, so nothing is guessed — a fabricated value would be indistinguishable from the real one at the
+  point where it decides the next request's budget.
+- One downshift only. A second refusal is something else, and resending would just burn quota.
+- The catalog's published `max_output_tokens` and the learned value are combined with `min`, and then bounded by the
+  gateway-wide `200000` (measured: 200000 accepted, 200704 refused, independent of the model window).
+
+**A credit error is account-scoped: the key must rotate.** `INSUFFICIENT_CREDITS` / `USAGE_EXCEEDED` /
+`PREMIUM_CREDITS_EXHAUSTED` / `402 insufficient credits` all mean "this account is out of money" while other keys in
+the pool are perfectly usable — so they are **not** in the key-independent list, which keeps only the model-scoped
+`MODEL_NOT_IN_PLAN` / `model not in plan`. Matching normalises case and underscores/spaces, because the upstream JSON
+spells it `MODEL_NOT_IN_PLAN` and the prose spells it `model not in plan`.
+
+> Treating a credit error as key-independent is the most expensive misclassification in a multi-key deployment: the
+> whole pool fails because the first account is broke, when the correct handling is simply the next key.
 
 ## Memory & Deployment
 

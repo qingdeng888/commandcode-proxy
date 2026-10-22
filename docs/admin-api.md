@@ -226,7 +226,8 @@ Key 列表项（下称 `KeyItem`）：
 { "success": true, "data": {
   "models": [
     { "id": "claude-sonnet-5", "name": "Claude Sonnet 5",
-      "contextLength": 1000000, "supportedEndpoints": ["/messages"],
+      "contextLength": 1000000, "maxOutputTokens": 128000,
+      "supportedEndpoints": ["/messages"],
       "source": "upstream", "enabled": true }
   ],
   "counts": { "total": 82, "enabled": 80, "disabled": 2 },
@@ -242,6 +243,8 @@ Key 列表项（下称 `KeyItem`）：
 
 - `enabled`：该模型当前是否可用。**默认启用**：禁用状态存成稀疏集合（只记被禁用的 id），
   所以上游新增的模型默认就是可用的，不需要为每个新模型补记录。
+- `maxOutputTokens`：上游公布的单模型输出上限（`max_output_tokens` / `maxOutputTokens`，缺则 `null`）。
+  它参与 `max_tokens` 的夹逼：与网关硬上限 200000、运行时从 400 错误里学到的值取小。
 - `counts`：`{total, enabled, disabled}`，供列表页显示。
 - `staleDisabled`：禁用记录里那些**已不在上游目录**的 id（仅提示，不自动清理 ——
   上游若重新提供该模型，禁用状态仍然生效）。

@@ -1,5 +1,6 @@
 // issue #38：上游「没有正常走完」的四种情形都必须如实上报，不能谎报成功。
-// 对齐 CLI（command-code@1.54.0 dist/cli.mjs）：
+// 对齐 CLI（command-code@1.54.0 引入，1.87.1 dist/cli.mjs 复核；1.87.1 另加了 refusal 一族，
+// 由 test/protocol-1.87.test.mjs 覆盖）：
 //   normalizeStopReason2 把 max_output_tokens / model_context_window_exceeded 归到 max_tokens
 //   isNetworkFailureFinish 把 network/connection/upstream-error 当成可重试的 502
 //   没有 finish 事件 → "Stream ended unexpectedly before completion (no finish event)"

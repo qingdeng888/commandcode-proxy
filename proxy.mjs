@@ -41,7 +41,7 @@ const apiKeyPool = createApiKeyPool({ log: (...args) => log(...args) });
 // 后台鉴权（与数据面的凭证体系又是另一套：它管的是「谁能打开面板」）
 const adminAuth = createAdminAuth({ log: (...args) => log(...args) });
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.54.0 复核未变） ──
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.87.1 复核未变） ──
 // CPU 型号与核数对应表（仅 Windows x64）。
 // ⚠️ 上网的 components.cpuCount 必须是 **threads** 而不是 cores ——
 // CLI 的 gatherRawSignals 取的是 `os.cpus().length`，即**逻辑处理器数**。
@@ -184,11 +184,23 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.87.1 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.53.1';
+//
+// 1.53.1 → 1.87.1 逐条比对 dist/cli.mjs 后，**影响本代理**的差异只有下面几条
+// （生成端点、9 键信封与键序、toWireMessages/toWireTools/toWireSystem 的形状全部未变）：
+//   · 头部常量表新增 x-cli-surface：只在 acp / rpc 这类非交互入口才发，普通会话不发；
+//     另有 x-oss-primary-provider、x-cmd-provider-deepseek-internal，分别是 BYOK 与
+//     内部账号的开关，普通会话同样不发 —— 本代理一律不发，与「普通会话」保持一致；
+//   · 流事件新增 cache-write-tokens（把 cacheWriteTokens 单独作为一条事件回传，
+//     供 usage 缺该字段时补齐）与 tool-result / server_tool_result（providerExecuted
+//     的服务端工具结果），旧代理会把它们打成 Unknown CC event type；
+//   · finishReason 归一化新增 refusal：refusal / content_filter / content-filter 三种
+//     写法都算「被拦截」，CLI 的 consumedStopReason 会先判它再判 tool-calls/length；
+//   · 没有 finish 事件时仍抛 "no finish event" 的可重试 502（与 1.53.1 一致）。
+const CC_PROTOCOL_VERSION = '1.87.1';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
@@ -1063,6 +1075,14 @@ function buildCcRequest(openaiReq) {
   // 打在更早的位置（如 system 末块）会把消息历史留在前缀之外，长会话每轮全量重复计费；
   // 只打第一条 user 消息同样会让后续轮次的增量始终处于断点之外。
   // 客户端自己带了 cache_control（system 块数组或任意消息块）就完全尊重客户端，不重复打点。
+  //
+  // 为什么不额外给 params.system 打一个断点（参考实现在 /provider/v1/messages 上会打三个）：
+  // 那是**另一个传输**。1.87.1 的 CLI 确实在 toWireSystem 里给带 cache 的 section 发
+  // cache_control，但 /alpha/generate 的缓存是**隐式前缀**机制 —— 实测同一前缀重发时
+  // cacheReadTokens 会自然命中（约 54k），不依赖任何显式断点；而显式断点在 Anthropic
+  // 系列模型上是**按写缓存计费**的（cacheWriteCost 高于 inputCost），在我们无法实测
+  // 收益的这条路由上主动加，是在给自己增加成本。因此这里只补「前缀末端」这一个点，
+  // 且仅在客户端表达了缓存意图（prompt_cache_key）而自己没打点时补。
   const hasCacheMarker = systemBlocks.some(b => b.cache_control) || ccMessages.some(msg =>
     Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
   if (prompt_cache_key && !hasCacheMarker) {
@@ -1093,7 +1113,14 @@ function buildCcRequest(openaiReq) {
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
-      max_tokens: Math.min(max_tokens || 64000, 200000),
+      // 三段夹逼，取小：
+      //   1) 客户端要的（缺省 64000，对齐 CLI 的 VT = 64e3）；
+      //   2) 网关硬上限 200000 —— 实测 200000 被接受、200704 被拒，是网关级的，
+      //      与模型窗口无关（1M 窗口的模型也一样）；
+      //   3) 该模型已知的输出上限（目录公布的 max_output_tokens，或上游在某次
+      //      400 里亲口报出、被 outputCeilingFor 学到的值）。未知时是 Infinity，
+      //      等于只受前两段约束 —— 不猜、不放宽。
+      max_tokens: Math.min(max_tokens || 64000, 200000, outputCeilingFor(model)),
       stream: true,  // CC API 总是 stream
     },
   };
@@ -1148,7 +1175,7 @@ function buildCcRequest(openaiReq) {
 
 // ── 工具名为什么一个都不重命名（已删掉的别名表的墓志铭） ──────────────
 // 上游 d063b47 曾引入一张 4 项别名表并作用于 params.tools[].name。查 CLI 源码后
-// （command-code@1.54.0 dist/cli.mjs）确认：**wire 协议里没有工具重命名这回事**。
+// （command-code@1.54.0，1.87.1 复核仍成立）确认：**wire 协议里没有工具重命名这回事**。
 //
 // CLI 里确实存在两个改名的函数，但都不适用于反代：
 //
@@ -1185,6 +1212,31 @@ function tryParseJSON(str) {
   try { return JSON.parse(str); } catch { return {}; }
 }
 
+// ── 孤立代理项（lone surrogate）清洗 ──────────────────────────────
+// JSON.stringify 不会拒绝孤立的 UTF-16 半代理项，而是把它写成 `"\ud83d"` 转义。
+// 客户端截断字符串（把 emoji 劈成两半）时就会产生这种值，严格的解码端会直接 400。
+// 官方 provider（pi 的 commandcode 传输）对这条端点上的每个字符串都做同样的清洗。
+//
+// 实现要点（来自 dsh-commandcode-provider 的实测结论）：
+//   · 用 JSON.stringify 的 replacer 挂在**唯一**的序列化点上，三种协议、所有字段一次覆盖；
+//   · 没有任何代理项的字符串原样返回（零拷贝）；
+//   · 前置判断必须是**非全局**正则 —— 全局正则有 lastIndex 状态，反复 test() 会在
+//     true/false 之间抖动；
+//   · 成对代理项（合法的 astral 字符，即 emoji）必须原样保留：朴素的范围过滤会删掉所有 emoji。
+const ANY_SURROGATE_PATTERN = /[\uD800-\uDFFF]/;
+const LONE_SURROGATE_PATTERN = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+function sanitizeSurrogates(value) {
+  if (typeof value !== 'string') return value;
+  if (!ANY_SURROGATE_PATTERN.test(value)) return value;
+  return value.replace(LONE_SURROGATE_PATTERN, '');
+}
+
+/** 供 JSON.stringify 使用的 replacer：只处理字符串，其余原样。 */
+function sanitizeReplacer(_key, value) {
+  return typeof value === 'string' ? sanitizeSurrogates(value) : value;
+}
+
 // ── CC NDJSON → OpenAI SSE 转换 ────────────────────
 
 function createSseTranslator(model, completionId, created) {
@@ -1198,6 +1250,11 @@ function createSseTranslator(model, completionId, created) {
   // 不认识的结束原因折成 stop 正常收尾，不再进这里。
   let usage = null;
   let toolCallIndex = 0;
+  // cache_write_tokens 事件单独回传的「写缓存」用量（1.87.1 新增的事件）。
+  // 主路径仍是 totalUsage.inputTokenDetails.cacheWriteTokens；这个值只在
+  // 上游单发事件、而 usage 明细缺失时用来补齐（CLI 的
+  // readCapturedCacheWriteTokens 做的就是这件事）。
+  let capturedCacheWriteTokens = 0;
 
   return {
     lastCcEvent: '',
@@ -1205,6 +1262,7 @@ function createSseTranslator(model, completionId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    get cacheWriteTokens() { return capturedCacheWriteTokens; },
     /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
     parseLine(line) {
       const trimmed = line.trim();
@@ -1286,6 +1344,13 @@ function createSseTranslator(model, completionId, created) {
             total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
             prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
           } : undefined;
+          // 单独发来的 cache-write-tokens 只在 usage 明细缺失时补齐 —— 有明细就以明细为准，
+          // 两者相加会重复计账（CLI 的 readCapturedCacheWriteTokens 同样只在
+          // cacheWriteTokens === 0 时兜底）。
+          if (capturedCacheWriteTokens > 0) {
+            const details = (u.inputTokenDetails ||= {});
+            if (!details.cacheWriteTokens) details.cacheWriteTokens = capturedCacheWriteTokens;
+          }
           if (OPENAI_FINISH_REASONS.has(fr)) {
             out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
           } else {
@@ -1318,6 +1383,18 @@ function createSseTranslator(model, completionId, created) {
           break;
         }
 
+        // 1.87.1 新增：把写缓存 token 单独作为一条事件回传。只记下来，
+        // 等 finish 时若 usage 明细里没有 cacheWriteTokens 再补上（见 capturedCacheWriteTokens）。
+        case 'cache-write-tokens': {
+          const n = Number(event.cacheWriteTokens);
+          if (Number.isFinite(n) && n >= 0) capturedCacheWriteTokens = n;
+          break;
+        }
+
+        // 上游服务端工具的执行结果（providerExecuted）。代理不执行工具，
+        // 也拿不到对应的客户端 tool_call_id 语义 —— 静默忽略，绝不能当成
+        // Unknown 事件刷屏（1.87.1 起才出现在事件集里）。
+        case 'server_tool_result': case 'tool-result':
         case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
           // Silent - no user-visible content
           break;
@@ -1391,7 +1468,9 @@ function anthropicInputTokens(usage, noCacheOverride) {
 }
 
 // 上游 finishReason → 本代理内部规范化取值。
-// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.54.0）：
+// 对齐 CLI 的 normalizeStopReason2 / consumedStopReason / isNetworkFailureFinish
+// （command-code@1.87.1 dist/cli.mjs；1.53.1 → 1.87.1 这一段只多了 refusal 一族）：
+//   refusal | content_filter | content-filter            → refusal
 //   tool_use | tool-calls | tool_calls                    → tool_calls
 //   length | max_tokens | max_output_tokens
 //          | model_context_window_exceeded                → length
@@ -1406,9 +1485,11 @@ function anthropicInputTokens(usage, noCacheOverride) {
 // 例外：裸 'error' 必须并进 upstream_error。Command Code 在 provider 返回空响应时
 // 发 `finish` + `finishReason:"error"`；它不是可透出的业务值，原样返回会变成非法的
 // OpenAI finish_reason（严格客户端整条流反序列化失败），也会丢掉可重试语义。
+const REFUSAL_FINISH_REASONS = new Set(['refusal', 'content_filter', 'content-filter']);
 function mapFinishReason(reason) {
   const r = String(reason ?? '').trim().toLowerCase();
   if (!r) return 'stop';
+  if (REFUSAL_FINISH_REASONS.has(r)) return 'refusal';
   if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
   if (r === 'length' || r === 'max_tokens'
       || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
@@ -1949,7 +2030,9 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   const response = await upstreamFetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify(body),
+    // 唯一的序列化点：孤立代理项在这里统一清掉，三种协议与所有字段一次覆盖
+    //（见 sanitizeSurrogates 的注释；官方 CLI 依赖的 provider 也做同样的事）。
+    body: JSON.stringify(body, sanitizeReplacer),
     signal,
   });
 
@@ -1960,11 +2043,48 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 const RETRYABLE_KEY_STATUS = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
 
 // 状态码之外还要看错误体：上游把「模型不在套餐内」这类与 Key 无关的业务限制
-// 也用 401/403 表达，若一律当作 Key 失效，多 Key 下会把每个 Key 都试一遍才放弃
-const NON_KEY_ERROR_MARKERS = ['MODEL_NOT_IN_PLAN'];
+// 也用 401/403 表达，若一律当作 Key 失效，多 Key 下会把每个 Key 都试一遍才放弃。
+//
+// 只保留**模型维度**的标记。额度类（INSUFFICIENT_CREDITS / USAGE_EXCEEDED /
+// PREMIUM_CREDITS_EXHAUSTED / insufficient credits）是**账号维度**的，换 Key 正是
+// 正确处置 —— 若也归到这里，多 Key 部署会对着同一个余额不足的账号反复失败，
+// 而池里其它 Key 明明还能用。这与参考实现（dsh-commandcode-provider）把额度类
+// 当作「该换账号」的信号是同一个判断，只是本项目的处置动作叫「换 Key」。
+// 匹配要容忍大小写与下划线/空格两种写法（上游 JSON 是 MODEL_NOT_IN_PLAN，
+// 错误正文里是 "model not in plan"），这也是参考实现 hasTerminalStreamMarker 的口径。
+const NON_KEY_ERROR_MARKERS = ['model not in plan'];
 
 function isKeyIndependentError(bodyText) {
-  return NON_KEY_ERROR_MARKERS.some(marker => bodyText.includes(marker));
+  const normalized = String(bodyText || '').toLowerCase().replaceAll('_', ' ');
+  return NON_KEY_ERROR_MARKERS.some(marker => normalized.includes(marker));
+}
+
+// 输出上限拒绝：上游会用 `max_tokens: 200000 > 128000, which is the maximum
+// allowed number of output tokens for <model>` 这种句式把**真实上限**写在错误里。
+// 只解析带比较式的形态 —— 只报「invalid max_tokens」而不给数字时猜一个值，
+// 比直接失败更糟：猜出来的数字和真实上限在后续请求里无从区分。
+const OUTPUT_CEILING_REJECTION = /max_tokens:\s*\d+\s*>\s*(\d+)/i;
+
+// 进程级学习结果：模型 → 上游亲口报出的输出上限。只收紧、不放大。
+// 命中一次之后，同一模型的后续请求在 buildCcRequest 里就被预先夹到这个值，
+// 不必每个请求都白吃一次 400（参考实现 learnedOutputLimits 的同一思路）。
+const learnedOutputCeilings = new Map();
+
+function parseOutputCeiling(text) {
+  const stated = OUTPUT_CEILING_REJECTION.exec(String(text || ''))?.[1];
+  if (stated === undefined) return null;
+  const n = Number(stated);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/** 该模型已知的输出上限（目录公布的与运行时学到的取小）；未知返回 Infinity。 */
+function outputCeilingFor(model) {
+  if (!model) return Infinity;
+  // catalog 在模块初始化之后才被赋值，但本函数只在处理请求时调用，不存在 TDZ 问题
+  const published = catalog.get(model)?.maxOutputTokens;
+  const learned = learnedOutputCeilings.get(model);
+  const values = [published, learned].filter(v => Number.isFinite(v) && v > 0);
+  return values.length ? Math.min(...values) : Infinity;
 }
 
 // 读取错误响应体并还原为等价的新 Response。body 只能消费一次，
@@ -1991,15 +2111,42 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
   const maxAttempts = Math.min(Math.max(keyPool.size, 1), MAX_KEY_ATTEMPTS);
   const tried = new Set();
   let key = firstKey;
+  // 输出上限降档只允许一次：上游亲口报出的上限收下之后重发同一请求，
+  // 再被拒就是别的原因了，继续重试只会白烧额度。
+  let ceilingDownshifted = false;
 
   for (let attempt = 1; ; attempt++) {
     tried.add(key);
     await ensureInitialized(key, signal);
-    const response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
+    // let：输出上限降档分支会把消费过的响应换成还原出来的等价响应
+    let response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
 
     if (response.ok) {
       keyPool.recordRequest(key, { ok: true });
       return { response };
+    }
+
+    // 输出上限拒绝与 Key 无关，换 Key 也没用 —— 但降档后重发**同一次**是有效的：
+    // 把上游写明的上限记下来（进程级，只收紧不放大），夹住 max_tokens 再发一次。
+    if (!ceilingDownshifted && (response.status === 400 || response.status === 422)) {
+      const { text, response: restored } = await drainErrorResponse(response);
+      const ceiling = parseOutputCeiling(text);
+      const sent = ccBody?.params?.max_tokens;
+      const model = ccBody?.params?.model;
+      if (ceiling && Number.isFinite(sent) && ceiling < sent) {
+        ceilingDownshifted = true;
+        const prev = learnedOutputCeilings.get(model);
+        if (prev === undefined || ceiling < prev) learnedOutputCeilings.set(model, ceiling);
+        ccBody.params.max_tokens = ceiling;
+        log('warn', 'Upstream output ceiling is lower than requested, retrying once at the stated ceiling', {
+          model, requestedMaxTokens: sent, ceiling, status: response.status,
+        });
+        // 不记这个 Key 的失败：这是请求侧的预算问题，与该 Key 的健康/额度无关
+        attempt--;   // 降档重发不计入 Key 轮换次数：这不是「换一个 Key」，是重发同一请求
+        continue;
+      }
+      // 不是输出上限拒绝 → 把响应还原回去，继续走原来的分类逻辑
+      response = restored;
     }
 
     // 状态码本身不值得换 Key，或已达尝试上限 → 记一次失败后交调用方处理
@@ -2058,7 +2205,11 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
 function splitInputTokens(u) {
   const d = (u && u.inputTokenDetails) || {};
   const read = Number(d.cacheReadTokens ?? u?.cachedInputTokens) || 0;
-  const write = Number(d.cacheWriteTokens) || 0;
+  // 顶层 cacheWriteTokens 不是上游 usage 的字段，而是两处**代理内部**的载体：
+  //   1) chat 翻译器（把 1.87.1 的 cache-write-tokens 事件单独收下的值暴露出来）；
+  //   2) messages 非流式的 ctx.cacheWriteTokens。
+  // 放在明细之后兜底：有 inputTokenDetails 就以它为准，避免两处相加重复计账。
+  const write = Number(d.cacheWriteTokens) || Number(u?.cacheWriteTokens) || 0;
   return { cacheRead: read, cacheWrite: write };
 }
 
@@ -2510,6 +2661,10 @@ async function handleChatCompletions(req, res) {
               case 'text-start': case 'text-end': case 'start': case 'start-step':
               case 'reasoning-start': case 'reasoning-end':
               case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              // 1.87.1 起上游还会发 cache-write-tokens（写缓存用量单发一条）与
+              // server_tool_result / tool-result（providerExecuted 的服务端工具结果）。
+              // 非流式路径不区分这些细粒度事件，只要不刷 Unknown 警告即可。
+              case 'cache-write-tokens': case 'server_tool_result': case 'tool-result':
               case 'tool-error':
                 // Silent - no user-visible content
                 break;
@@ -2701,6 +2856,10 @@ const OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_
 //     一轮回答（provider 若稳定返回 other 会重试到上限后整轮失败）。
 function toOpenAIFinishReason(finishReason) {
   if (finishReason === 'pause_turn') return 'length';
+  // refusal 是 OpenAI 侧唯一合法的「被拦截」枚举（refusal / content_filter /
+  // content-filter 三种上游写法已在 mapFinishReason 归一）。不折成 content_filter
+  // 就会被当成「不认识的结束原因」→ 折成 stop 谎报完成，或走 502 白丢一轮回答。
+  if (finishReason === 'refusal') return 'content_filter';
   if (finishReason === 'upstream_error') return finishReason;
   if (OPENAI_FINISH_REASONS.has(finishReason)) return finishReason;
   log('warn', 'Unrecognized upstream finish reason', { reason: String(finishReason), mappedTo: 'stop' });
@@ -3112,6 +3271,16 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             break;
           }
 
+          // 1.87.1 新增：写缓存用量单发一条事件；本路径以 finish 里的 usage 为准，
+          // 这里只在 usage 明细缺失时补齐（与 chat 翻译器同一口径）。
+          case 'cache-write-tokens': {
+            const n = Number(event.cacheWriteTokens);
+            if (Number.isFinite(n) && n >= 0 && n > cacheWriteTokens) cacheWriteTokens = n;
+            break;
+          }
+
+          // 服务端工具结果（providerExecuted）：代理不执行工具，静默忽略。
+          case 'server_tool_result': case 'tool-result':
           case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
             // Silent - no user-visible content
             break;
@@ -3458,6 +3627,10 @@ async function handleMessages(req, res) {
               case 'text-start': case 'text-end': case 'start': case 'start-step':
               case 'reasoning-start': case 'reasoning-end':
               case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              // 1.87.1 起上游还会发 cache-write-tokens（写缓存用量单发一条）与
+              // server_tool_result / tool-result（providerExecuted 的服务端工具结果）。
+              // 非流式路径不区分这些细粒度事件，只要不刷 Unknown 警告即可。
+              case 'cache-write-tokens': case 'server_tool_result': case 'tool-result':
               case 'tool-error':
                 // Silent - no user-visible content
                 break;
@@ -3892,14 +4065,19 @@ function buildResponsesObject(responseId, model, created, fullText, thinkingText
   const o = opts || {};
   const truncated = o.finishReason === 'length';
   const paused = o.finishReason === 'pause_turn';
+  // Responses 的 incomplete_details.reason 只有 max_output_tokens / content_filter
+  // 两个合法值。上游的 refusal（内容拦截）属于后者：报成 completed 是把「被拦截」
+  // 谎报成「答完了」，报 max_output_tokens 又会误导下游去压缩上下文。
+  const filtered = o.finishReason === 'refusal';
   return {
     id: responseId,
     object: 'response',
     created_at: created,
-    status: (truncated || paused) ? 'incomplete' : 'completed',
+    status: (truncated || paused || filtered) ? 'incomplete' : 'completed',
     completed_at: nowUnix(),
     error: null,
     incomplete_details: truncated ? { reason: 'max_output_tokens' }
+      : filtered ? { reason: 'content_filter' }
       : paused ? { reason: 'pause_turn' } : null,
     input: o.input || [],
     instructions: o.instructions === undefined ? null : o.instructions,
@@ -4125,13 +4303,17 @@ function createResponsesSseTranslator(model, responseId, created) {
         return out;
       }
       // 'length' 表示被截断（max_output_tokens / model_context_window_exceeded 都归一到这里）；
-      // 'pause_turn' 同样是「后面还有内容没发完」，规范要求 status=incomplete。
+      // 'pause_turn' 同样是「后面还有内容没发完」，规范要求 status=incomplete；
+      // 'refusal'（上游 content_filter 一族）同样是「没答完」，且必须如实说明是被拦截。
       const truncated = finishReason === 'length';
       const paused = finishReason === 'pause_turn';
-      out.push(sse(truncated || paused ? 'response.incomplete' : 'response.completed', {
-        response: Object.assign(baseResponse(truncated || paused ? 'incomplete' : 'completed', doneItems.slice()), {
+      const filtered = finishReason === 'refusal';
+      const notDone = truncated || paused || filtered;
+      out.push(sse(notDone ? 'response.incomplete' : 'response.completed', {
+        response: Object.assign(baseResponse(notDone ? 'incomplete' : 'completed', doneItems.slice()), {
           output_text: textAcc,
           incomplete_details: truncated ? { reason: 'max_output_tokens' }
+            : filtered ? { reason: 'content_filter' }
             : paused ? { reason: 'pause_turn' } : null,
           usage: buildResponsesUsage(usage, this.outputTokens),
         }),
@@ -4439,6 +4621,7 @@ async function handleResponses(req, res) {
             case 'text-start': case 'text-end': case 'start': case 'start-step':
             case 'reasoning-start': case 'reasoning-end':
             case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+            case 'cache-write-tokens': case 'server_tool_result': case 'tool-result':
             case 'tool-error':
               // Silent - no user-visible content
               break;

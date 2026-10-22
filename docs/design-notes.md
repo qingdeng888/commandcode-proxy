@@ -71,3 +71,44 @@
   （`/provider/v1/usage`、`/provider/v1/balance`、`/api/v1/users/me` 全部 404），
   故改为按上游错误码就地分类。
 - **Cline 的账号刷新令牌机制不适用**：CC 用的是静态 `user_` Key。
+
+## 6. 协议保真（wire fidelity）
+
+协议约定的唯一来源是官方 npm 包 `command-code` 的 `dist/cli.mjs`（压缩但未混淆）。
+当前对齐版本是 **1.87.1**，写在 `proxy.mjs` 的 `CC_PROTOCOL_VERSION` 里，
+**报的是「已实现的协议版本」而不是「npm 上的最新版本」** —— npm 上更新只打漂移告警。
+理由：真机发出去的永远是「形状 + 版本号」自洽的组合；版本号跟着 npm 跑而形状没变，
+等于自称最新版却说旧方言，比版本号过期更容易被行为分析挑出来。
+
+1.87.1 复核后，影响本代理的差异只有四处，均已落实并有测试锁定
+（`test/protocol-1.87.test.mjs`）：
+
+| 差异 | 本代理的做法 |
+|------|--------------|
+| 头部表新增 `x-cli-surface` / `x-oss-primary-provider` / `x-cmd-provider-deepseek-internal` | **一个都不发**。三者分别只在 acp/rpc 入口、BYOK、内部账号时出现，普通会话不发；代理自称普通会话就必须一致 |
+| 事件集新增 `cache-write-tokens` | 收下，但只在 `totalUsage.inputTokenDetails.cacheWriteTokens` 缺失时补齐 —— 两处相加会重复计账 |
+| 事件集新增 `tool-result` / `server_tool_result` | 静默忽略。那是 providerExecuted 的服务端工具结果，代理不执行工具；但**绝不能**落到 `Unknown CC event type`（四条路径的静默表都已补） |
+| `finishReason` 新增 `refusal` 一族（`refusal` / `content_filter` / `content-filter`） | 归一成内部值 `refusal`，出口按协议落地：OpenAI → `content_filter`，Anthropic → `refusal`，Responses → `status: incomplete` + `incomplete_details.reason: content_filter`。折成 `stop` 是谎报完成 |
+
+另外三条与版本无关、但同属「出网必须干净」的约定：
+
+- **孤立代理项在唯一的序列化点清掉。** `JSON.stringify` 会把半个 emoji 写成 `"\ud83d"`
+  而不报错，严格的上游解码器会直接 400。用 replacer 挂在 `forwardToCC` 里的
+  `JSON.stringify(body, sanitizeReplacer)` 上，三种协议、所有字段一次覆盖。
+  前置判断用**非全局**正则（全局正则的 `lastIndex` 会让 `test()` 抖动），
+  成对代理项（真实 emoji）原样保留 —— 朴素的范围过滤会删掉所有 emoji。
+- **额度类错误是账号维度，必须换 Key。** 「与 Key 无关」的名单只留模型维度的
+  `MODEL_NOT_IN_PLAN`（匹配时把下划线归一成空格、并转小写，因为 JSON 写
+  `MODEL_NOT_IN_PLAN`、正文写 `model not in plan`）。额度类若也进去，多 Key 部署会
+  因为第一个没钱的账号整池失败。
+- **输出上限拒绝按上游写明的数字降档重发一次。** 只解析 `max_tokens: X > Y` 这种
+  比较式；只报 `invalid max_tokens` 而不给数字时不猜（猜出来的值与真实上限在后续
+  请求里无从区分）。学到的值进 `learnedOutputCeilings`（进程级、只收紧），
+  与目录公布的 `max_output_tokens`、网关硬上限 200000 一起在 `buildCcRequest` 里取小。
+
+**刻意不照搬参考实现的地方**：`/provider/v1/messages` 上参考实现会打三个 cache 断点
+（system / 最后一个 tool / 最后一条 user 消息），但那是**另一个传输**。
+`/alpha/generate` 的缓存是隐式前缀机制（实测同一前缀重发时 cacheReadTokens 自然命中），
+而显式 `cache_control` 在 Anthropic 系列模型上按写缓存计费。在我们无法实测收益的
+这条路由上主动加断点是在增加成本，因此只保留「客户端表达了缓存意图（`prompt_cache_key`）
+而自己没打点」时补一个前缀末端断点。
