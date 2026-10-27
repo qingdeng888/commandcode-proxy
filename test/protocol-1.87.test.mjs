@@ -279,6 +279,37 @@ test('1.87.1 头部：不发 x-cli-surface / x-oss-primary-provider / x-cmd-prov
     for (const h of ['x-cli-surface', 'x-oss-primary-provider', 'x-cmd-provider-deepseek-internal']) {
       assert.ok(!(h in headers), `${h} 只有非普通会话才会发，代理不得发送`);
     }
-    assert.equal(headers['x-command-code-version'], '1.87.1', '版本号应与实现对齐');
+    assert.equal(headers['x-command-code-version'], '1.88.0', '版本号应与实现对齐');
+  } finally { await s.close(); }
+});
+
+// ── ⑦ 网关 JSON 节点数上限：必须单列诊断，不能被当成上下文溢出 ──────
+
+test('JSON node count 上限 → 明确说是结构限制、给出网关写明的数字', async () => {
+  const s = await setup({
+    status: 400,
+    errorBody: JSON.stringify({ error: { message: 'JSON node count cannot exceed 32768' } }),
+  });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, AUTH);
+    assert.equal(r.status, 400, '上游 400 原样映射');
+    const j = await r.json();
+    assert.match(j.error.message, /32768/, '必须引用网关自己写明的上限数字');
+    assert.match(j.error.message, /structure/i, '要说明限制的是请求结构，不是 token 长度');
+    assert.match(j.error.message, /compacting|compress/i, '要提示压缩上下文通常不够');
+    assert.equal(j.error.node_limit, 32768, '机器可读字段，便于客户端自行判断');
+  } finally { await s.close(); }
+});
+
+test('普通 400 不被 JSON 节点诊断误伤', async () => {
+  const s = await setup({
+    status: 400,
+    errorBody: JSON.stringify({ error: { message: 'messages: field required' } }),
+  });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, AUTH);
+    const j = await r.json();
+    assert.ok(!('node_limit' in j.error), '无关的 400 不该带 node_limit');
+    assert.equal(j.error.message, 'messages: field required', '错误正文原样透出');
   } finally { await s.close(); }
 });

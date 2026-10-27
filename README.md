@@ -837,7 +837,7 @@ Produced by the proxy itself:
 | `401` | API key missing / malformed (must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
 | `404` | Unknown path |
 | `413` | Body exceeds `CC_MAX_BODY_MB` (connection kept alive and drained, not reset) |
-| `429` | Zero output tokens (non-streaming only; streaming reports 200 + `response.failed`, see "Zero-Output Guard"), stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
+| `429` | Zero output tokens (non-streaming only; streaming reports 200 + `response.failed`, see "Zero-Output Guard"), stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts **for the same session** a "reduce context" hint is returned |
 | `502` | CC upstream error (connection-level failures such as `fetch failed` also land here) |
 | `503` | `CC_MAX_INFLIGHT` is set and the in-flight cap is exceeded (`type: server_busy`) |
 
@@ -942,15 +942,15 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.87.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
+Aligned line-by-line against the official npm package source (`command-code@1.88.0`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init, using the same `User-Agent: cli` as generate |
 | **Session ID** | Taken from the client header when present (`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`); otherwise **derived deterministically from the request** — `sha1(apiKey + model + system + user text up to the first non-user message)` formatted as a UUID. |
-| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.87.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
-| **Ordinary-session header set** | The three headers 1.87.1 only sends outside a plain session — `x-cli-surface` (acp/rpc front doors), `x-oss-primary-provider` (BYOK), `x-cmd-provider-deepseek-internal` (internal accounts) — are never sent. Same for the long-gone `x-co-flag` |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.88.0`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **Ordinary-session header set** | The three headers the CLI only sends outside a plain session (present since 1.87.1) — `x-cli-surface` (acp/rpc front doors), `x-oss-primary-provider` (BYOK), `x-cmd-provider-deepseek-internal` (internal accounts) — are never sent. Same for the long-gone `x-co-flag` |
 | **Clean outgoing JSON** | Lone UTF-16 surrogate halves (a truncated emoji, produced by client-side slicing) are stripped at the single `JSON.stringify` call site via a replacer, so all three protocols are covered. Paired surrogates — every real emoji — survive untouched; `JSON.stringify` would otherwise emit `\ud83d` and a strict upstream decoder would 400 |
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |

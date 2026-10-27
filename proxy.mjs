@@ -41,7 +41,7 @@ const apiKeyPool = createApiKeyPool({ log: (...args) => log(...args) });
 // 后台鉴权（与数据面的凭证体系又是另一套：它管的是「谁能打开面板」）
 const adminAuth = createAdminAuth({ log: (...args) => log(...args) });
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.87.1 复核未变） ──
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.88.0 复核未变） ──
 // CPU 型号与核数对应表（仅 Windows x64）。
 // ⚠️ 上网的 components.cpuCount 必须是 **threads** 而不是 cores ——
 // CLI 的 gatherRawSignals 取的是 `os.cpus().length`，即**逻辑处理器数**。
@@ -184,7 +184,7 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.87.1 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.88.0 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
@@ -200,7 +200,19 @@ function generateFingerprint(apiKey) {
 //   · finishReason 归一化新增 refusal：refusal / content_filter / content-filter 三种
 //     写法都算「被拦截」，CLI 的 consumedStopReason 会先判它再判 tool-calls/length；
 //   · 没有 finish 事件时仍抛 "no finish event" 的可重试 502（与 1.53.1 一致）。
-const CC_PROTOCOL_VERSION = '1.87.1';
+//
+// 1.87.1 → 1.88.0 复核（同法比对，结论：纯请求头同步，运行时契约零变化）：
+//   · 端点集合 25 个，双向零增零减；
+//   · 透传的六个自定义头（x-command-code-version / x-cli-environment / x-project-slug /
+//     x-taste-learning / x-session-id / x-cmd-zdr）出现次数逐个相同；
+//   · toWireMessages / toWireTools / toWireSystem / toWireToolOutput /
+//     toWirePermissionMode / toWireThreadId / consumedStopReason 逐字相同；
+//   · consumeStream 只发生标识符改名，抹掉标识符后**逐字相同**（事件词汇表零变化）；
+//   · 指纹盐仍是 'command-code:device-fingerprint:v1'（只是变量名从 oP 改成 tP），
+//     buildMachineFingerprint / hashSignal 的算法与字段集合不变。
+// 唯一变化是内置模型注册表里若干行增加了 hidden 标记 —— 那是模型目录内容，
+// 而且本项目本来就从 /provider/v1/models 动态拉取，不依赖内置表。
+const CC_PROTOCOL_VERSION = '1.88.0';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
@@ -313,9 +325,47 @@ const CLIENT_DRAIN_TIMEOUT_MS = (() => {
   return Number.isFinite(ms) && ms > 0 ? ms : 0;
 })();
 
-// 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
-let consecutiveTimeouts = 0;
+// 连续超时计数：同一会话连续 3 次超时才提醒压缩上下文，任意成功请求后重置。
+//
+// 为什么按会话（而不是全进程一个计数）：一个计数器会让**毫不相干的会话**互相误伤 ——
+// A 会话卡住两次，B 会话第一次超时就被劝去压缩上下文，而它的请求根本没变大。
+// 参考实现（dsh-commandcode-provider 的 gradeHeaderTimeout）也是按 session 建 streak
+// 并做 FIFO 淘汰；本项目把 key 换成会话 id，其余口径一致。
+//
+// 无会话标识的请求落到同一个槽位（GLOBAL_TIMEOUT_KEY），保持「全局单值」的旧语义 ——
+// 否则它们永远不会累积到阈值，提示就再也不会出现。
 const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
+const GLOBAL_TIMEOUT_KEY = '\u0000global';
+/** 会话数上限：一个被放弃的会话不该永久占用一条记录（参考实现同样有上限）。 */
+const TIMEOUT_STREAK_MAX_ENTRIES = 200;
+const timeoutStreaks = new Map();   // sessionKey → 连续超时次数
+
+/** 记录一次超时，返回截至当前的连续次数（同一 key 才会累加）。 */
+function noteTimeout(sessionKey) {
+  const key = sessionKey || GLOBAL_TIMEOUT_KEY;
+  const next = (timeoutStreaks.get(key) || 0) + 1;
+  // 重新插入使 Map 的顺序成为 LRU：淘汰时丢掉最久没动静的那些会话
+  timeoutStreaks.delete(key);
+  timeoutStreaks.set(key, next);
+  if (timeoutStreaks.size > TIMEOUT_STREAK_MAX_ENTRIES) {
+    const oldest = timeoutStreaks.keys().next().value;
+    if (oldest !== undefined) timeoutStreaks.delete(oldest);
+  }
+  return next;
+}
+
+/** 一次成功请求后清掉该会话的 streak。 */
+function clearTimeouts(sessionKey) {
+  const key = sessionKey || GLOBAL_TIMEOUT_KEY;
+  if (timeoutStreaks.size > 0) timeoutStreaks.delete(key);
+}
+
+/** 超时提示：同一会话连续超时才劝压缩上下文。 */
+function timeoutMessage(sessionKey) {
+  return noteTimeout(sessionKey) >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+    ? 'Response timeout - try reducing context length (summarize earlier messages)'
+    : 'Response timeout - request timed out';
+}
 
 // ── 日志 ─────────────────────────────────────────────
 // CFG.logLevel 以前只是文档里的摆设（代码从不读它）。现在真正生效，
@@ -1237,6 +1287,32 @@ function sanitizeReplacer(_key, value) {
   return typeof value === 'string' ? sanitizeSurrogates(value) : value;
 }
 
+// ── 序列化结果按 params 身份复用 ─────────────────────────────
+// 一次请求会多次走到序列化点：多 Key 轮换、传输层闪断重试、输出上限降档重发。
+// 这些尝试之间正文**逐字节相同**（换的只是 Authorization / traceparent / x-session-id，
+// 它们都在 header 里，不在 body 里），而带图长会话的 body 可达几十 MB ——
+// 实测 28.4MB 的正文重新 stringify 一次要 ~150ms 的**同步**事件循环时间，
+// 期间进程里所有在途请求都被卡住。同一份正文序列化 5、6 次纯属浪费。
+//
+// 缓存键是 `ccBody.params` 对象本身（WeakMap，随 body 一起被 GC，不需要清理）。
+// 有效性判据是 `max_tokens`：降档重发会改这个值，改了就必须重新序列化 ——
+// 这是两条尝试之间**唯一**会变的 body 字段（其余字段在同一次请求内都不动）。
+// 若将来有别的字段在重试之间被改写，必须一并纳入这个判据，否则缓存会给出旧正文。
+const serializedBodyCache = new WeakMap();   // params → { maxTokens, text }
+
+function serializeCcBody(body) {
+  const params = body && body.params;
+  if (!params || typeof params !== 'object') {
+    return JSON.stringify(body, sanitizeReplacer);
+  }
+  const maxTokens = params.max_tokens;
+  const hit = serializedBodyCache.get(params);
+  if (hit && hit.maxTokens === maxTokens) return hit.text;
+  const text = JSON.stringify(body, sanitizeReplacer);
+  serializedBodyCache.set(params, { maxTokens, text });
+  return text;
+}
+
 // ── CC NDJSON → OpenAI SSE 转换 ────────────────────
 
 function createSseTranslator(model, completionId, created) {
@@ -1530,6 +1606,16 @@ function incompleteUpstreamError(detail) {
 }
 
 // ── 错误映射 ───────────────────────────────────────
+
+// 网关的 JSON 节点数上限：`400 JSON node count cannot exceed 32768`。
+// 这是**结构**限制，不是 token 限制 —— 实测在 1M 窗口模型的 22.6% 处就会撞上
+// （1436 条消息 + 61 个图片块）。把它当上下文溢出报，客户端会去压缩上下文：
+// 压缩确实能减少消息与图片块数，但通常不足以降到上限以内，于是压缩完再撞一次，
+// 在长上下文上按全价白烧一轮。参考实现对这一类单列诊断，本项目同样单列。
+//
+// 只引用网关自己写明的数字：上限归网关所有，可能变化，猜一个值比不猜更糟。
+const JSON_NODE_LIMIT_REJECTION = /JSON node count cannot exceed\s+(\d+)/i;
+
 const CC_STATUS_MAP = {
   400: { status: 400, type: 'invalid_request_error' },
   401: { status: 401, type: 'authentication_error' },
@@ -1568,6 +1654,27 @@ function mapCcError(ccStatus, ccBody) {
       body: {
         error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
         retry_after: 30,
+      },
+    };
+  }
+
+  // JSON 节点数上限：必须在通用错误之前识别，否则客户端只能看到一句无法行动的 400。
+  // 措辞要同时说清三件事：限制的是结构、给了数字、压缩通常不够。
+  const nodeLimit = JSON_NODE_LIMIT_REJECTION.exec(message)?.[1];
+  if (nodeLimit !== undefined) {
+    return {
+      status: mapped.status,
+      code,
+      body: {
+        error: {
+          message: `Request exceeds the gateway's JSON node limit (node count cannot exceed ${nodeLimit}) — `
+            + 'the cap is on the request\'s structure, not its token length, so compacting the context usually '
+            + 'will not be enough; start a new session, or reduce the number of messages and images in this one. '
+            + `Upstream said: ${message}`,
+          type: mapped.type,
+          ...(code ? { code } : {}),
+          node_limit: Number(nodeLimit),
+        },
       },
     };
   }
@@ -2032,7 +2139,9 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers,
     // 唯一的序列化点：孤立代理项在这里统一清掉，三种协议与所有字段一次覆盖
     //（见 sanitizeSurrogates 的注释；官方 CLI 依赖的 provider 也做同样的事）。
-    body: JSON.stringify(body, sanitizeReplacer),
+    // 同一请求的多次尝试（换 Key / 闪断重试 / 上限降档）共用这份序列化结果，
+    // 见 serializeCcBody —— 带图长会话重新 stringify 一次要上百毫秒同步时间。
+    body: serializeCcBody(body),
     signal,
   });
 
@@ -2285,6 +2394,10 @@ async function handleChatCompletions(req, res) {
   const promptCacheKey = openaiReq.prompt_cache_key;
   openaiReq = null;
 
+  // 连续超时的作用域：优先用客户端给的会话标识，没有就按内容派生。
+  // forwardToCC 里会再算一次同样的值 —— 这里先取是为了让超时计数按会话隔离。
+  const sessionKey = getSessionId(req.headers, apiKey, promptCacheKey, ccBody).id;
+
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   // 每次尝试都换一个新的（已 abort 的 signal 不可复用）
   let abortController = new AbortController();
@@ -2457,8 +2570,8 @@ async function handleChatCompletions(req, res) {
         }
 
         if (!aborted) {
-          // 成功完成一次请求，重置连续超时计数
-          consecutiveTimeouts = 0;
+          // 成功完成一次请求，重置本会话的连续超时计数
+          clearTimeouts(sessionKey);
           if (buffer.trim()) {
             const events = translator.parseLine(buffer);
             if (events) {
@@ -2537,10 +2650,7 @@ async function handleChatCompletions(req, res) {
           });
           try { reader.cancel().catch(() => {}); } catch {}
           try { abortController.abort(); } catch {} // 打断 CC 上游，避免浪费 token
-          consecutiveTimeouts++;
-          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-            ? 'Response timeout - try reducing context length (summarize earlier messages)'
-            : 'Response timeout - request timed out';
+          const timeoutMsg = timeoutMessage(sessionKey);
           if (!started) {
             sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
             return;
@@ -2724,7 +2834,7 @@ async function handleChatCompletions(req, res) {
         return;
       }
 
-      consecutiveTimeouts = 0;
+      clearTimeouts(sessionKey);
       sendJSON(res, 200, {
         id: completionId,
         object: 'chat.completion',
@@ -2784,10 +2894,7 @@ async function handleChatCompletions(req, res) {
       });
       try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      consecutiveTimeouts++;
-      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-        ? 'Response timeout - try reducing context length (summarize earlier messages)'
-        : 'Response timeout - request timed out';
+      const timeoutMsg = timeoutMessage(sessionKey);
       res.setHeader('Retry-After', '5');
       sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
       return; // 超时已按语义回给下游（由下游决定是否重试），本代理不重试
@@ -3389,6 +3496,11 @@ async function handleMessages(req, res) {
   openaiReq = null;
   anthropicReq = null;
 
+  // 连续超时的作用域：优先用客户端给的会话标识，没有就按内容派生（与 chat 路径同一口径）。
+  // 这里的 promptCacheKey 恒为 undefined —— Anthropic 协议没有这个字段，本路径的
+  // forwardWithKeyRetry 也不传它，所以两边算出来的 session 才是同一个。
+  const sessionKey = getSessionId(req.headers, apiKey, undefined, ccBody).id;
+
   const abortController = new AbortController();
   let aborted = false;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
@@ -3492,7 +3604,7 @@ async function handleMessages(req, res) {
         }
 
         if (!aborted) {
-          consecutiveTimeouts = 0;
+          clearTimeouts(sessionKey);
           if (ctx.upstreamError) {
             if (!started) {
               sendAnthropicError(
@@ -3533,18 +3645,12 @@ async function handleMessages(req, res) {
           });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
-            consecutiveTimeouts++;
-            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-              ? 'Response timeout - try reducing context length (summarize earlier messages)'
-              : 'Response timeout - request timed out';
+            const timeoutMsg = timeoutMessage(sessionKey);
             sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
             return;
           }
           if (!res.writableEnded) {
-            consecutiveTimeouts++;
-            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-              ? 'Response timeout - try reducing context length (summarize earlier messages)'
-              : 'Response timeout - request timed out';
+            const timeoutMsg = timeoutMessage(sessionKey);
             // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
             try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
           }
@@ -3681,7 +3787,7 @@ async function handleMessages(req, res) {
         return;
       }
 
-      consecutiveTimeouts = 0;
+      clearTimeouts(sessionKey);
       trackUsage(usage);
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
@@ -3706,10 +3812,7 @@ async function handleMessages(req, res) {
       });
       try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      consecutiveTimeouts++;
-      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-        ? 'Response timeout - try reducing context length (summarize earlier messages)'
-        : 'Response timeout - request timed out';
+      const timeoutMsg = timeoutMessage(sessionKey);
       res.setHeader('Retry-After', '5');
       sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
     } else {
@@ -4405,6 +4508,9 @@ async function handleResponses(req, res) {
   let reader = null;
   let translator = null;
 
+  // 连续超时的作用域：优先用客户端给的会话标识，没有就按内容派生（与 chat 路径同一口径）。
+  const sessionKey = getSessionId(req.headers, apiKey, promptCacheKey, ccBody).id;
+
   res.on('close', () => {
     if (res.writableEnded) return;
     aborted = true;
@@ -4523,7 +4629,7 @@ async function handleResponses(req, res) {
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
             for (const e2 of translator.finish()) res.write(e2);
           }
-          consecutiveTimeouts = 0;
+          clearTimeouts(sessionKey);
         }
       } catch (e) {
         if (aborted) {
@@ -4533,10 +4639,7 @@ async function handleResponses(req, res) {
             path: '/v1/responses', model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
             elapsedMs: Date.now() - startTime, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
           });
-          consecutiveTimeouts++;
-          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-            ? 'Response timeout - try reducing context length (summarize earlier messages)'
-            : 'Response timeout - request timed out';
+          const timeoutMsg = timeoutMessage(sessionKey);
           if (!started) { sendResponsesError(res, 429, 'rate_limit_error', timeoutMsg, 5); return; }
           if (!res.writableEnded) {
             // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
@@ -4671,7 +4774,7 @@ async function handleResponses(req, res) {
         return;
       }
 
-      consecutiveTimeouts = 0;
+      clearTimeouts(sessionKey);
       echoOpts.finishReason = finishReason;
       trackUsage(usage);
       sendJSON(res, 200, buildResponsesObject(

@@ -75,7 +75,7 @@
 ## 6. 协议保真（wire fidelity）
 
 协议约定的唯一来源是官方 npm 包 `command-code` 的 `dist/cli.mjs`（压缩但未混淆）。
-当前对齐版本是 **1.87.1**，写在 `proxy.mjs` 的 `CC_PROTOCOL_VERSION` 里，
+当前对齐版本是 **1.88.0**，写在 `proxy.mjs` 的 `CC_PROTOCOL_VERSION` 里，
 **报的是「已实现的协议版本」而不是「npm 上的最新版本」** —— npm 上更新只打漂移告警。
 理由：真机发出去的永远是「形状 + 版本号」自洽的组合；版本号跟着 npm 跑而形状没变，
 等于自称最新版却说旧方言，比版本号过期更容易被行为分析挑出来。
@@ -105,6 +105,30 @@
   比较式；只报 `invalid max_tokens` 而不给数字时不猜（猜出来的值与真实上限在后续
   请求里无从区分）。学到的值进 `learnedOutputCeilings`（进程级、只收紧），
   与目录公布的 `max_output_tokens`、网关硬上限 200000 一起在 `buildCcRequest` 里取小。
+
+### 6.1 后续跟进（1.88.0，纯请求头同步）
+
+1.88.0 的比对结论是**运行时契约零变化**：端点集合 25 个双向零增零减；透传的六个自定义头
+出现次数逐个相同；`toWireMessages` / `toWireTools` / `toWireSystem` / `toWireToolOutput` /
+`toWirePermissionMode` / `toWireThreadId` / `consumedStopReason` 逐字相同；`consumeStream`
+只有标识符改名（抹掉标识符后逐字相同，事件词汇表零变化）；指纹盐仍是
+`command-code:device-fingerprint:v1`（只是压缩后的变量名换了）。因此这次只改了
+`CC_PROTOCOL_VERSION`，没有任何形状调整 —— **版本号只随「确实实现的协议」前进**，
+不因为 npm 上出现了新版本就跟着报。
+
+### 6.2 从参考实现移植的两处（与协议版本无关）
+
+- **超时提示按会话隔离。** 原实现是全进程一个 `consecutiveTimeouts` 计数器，于是
+  A 会话卡住两次之后，毫不相干的 B 会话第一次超时就收到「请压缩上下文」。现在按
+  session id 建 streak（无 session 的请求落到同一个全局槽位，否则阈值永远不会触发），
+  并对条目数做 LRU 上限淘汰。`test/timeout-scope.test.mjs` 锁定：不同会话互不影响、
+  同一会话第三次才升级、成功请求重置、无 session 仍能累积。
+- **同一请求的多次尝试共用一份序列化结果。** 换 Key、闪断重试、输出上限降档都会
+  重新走到序列化点，而带图长会话的 body 实测 28.4MB，重新 `JSON.stringify` 一次约
+  150ms 的**同步**时间 —— 期间进程内所有在途请求都被卡住。现在按 `params` 对象身份
+  缓存（WeakMap，随 body 一起回收），有效性判据是 `max_tokens`：降档重发会改它，
+  改了必须重新序列化。`test/serialize-reuse.test.mjs` 用变异测试确认这条判据是必需的
+  （去掉后第二次仍发旧预算，降档等于没做）。
 
 **刻意不照搬参考实现的地方**：`/provider/v1/messages` 上参考实现会打三个 cache 断点
 （system / 最后一个 tool / 最后一条 user 消息），但那是**另一个传输**。
