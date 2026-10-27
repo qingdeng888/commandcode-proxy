@@ -360,7 +360,8 @@ Key 列表项（下称 `KeyItem`）：
   "zdr": false, "logLevel": "info", "logFile": "",
   "useProviderModels": true, "useProviderModelsWithPlanFilter": false,
   "webSearch": false, "modelRefreshIntervalMs": 300000,
-  "upstreamProxy": "", "strategy": "round_robin", "defaultModel": "deepseek/deepseek-v4-flash",
+  "upstreamProxy": "", "proxies": ["http://127.0.0.1:7890"], "proxyFile": "",
+  "strategy": "round_robin", "defaultModel": "deepseek/deepseek-v4-flash",
   "dataDir": "/app/data", "configPath": "/app/config.json",
   "settingsPath": "/app/data/settings.json",
   "version": "1.3.0",
@@ -451,3 +452,96 @@ Key 列表项（下称 `KeyItem`）：
 - 长任务按钮进入 loading 态并禁用，防重复提交。
 - 401 统一跳回登录视图。
 - Key 列表默认脱敏，点击 👁 才调 `reveal` 获取完整值，5 秒后自动重新脱敏。
+
+## 出站代理池
+
+代理池是「本代理从哪里出去访问 Command Code」的管理面。条目有三个来源，合并成一个池：
+
+| 来源 | 存储 | 能否删除 | 能否停用 |
+|------|------|----------|----------|
+| `ui` | `data/proxies.json` | ✅ | ✅ |
+| `config` | `config.json` 的 `proxies` 数组 | ❌ | ✅（停用记录写进 `data/proxies.json`）|
+| `proxyfile` | `proxyFile` 指向的文件，每行一条 | ❌ | ✅ |
+| `legacy` | `config.json` 的 `upstreamProxy`（历史单代理字段）| ❌ | ✅ |
+| `default` | 池子为空时自动补的 `direct` | ❌ | ❌ |
+
+> 停用只读条目是刻意的：`config.json` 是部署期输入，后台不许改写它；但「我暂时不想用这条」
+> 必须能表达，否则用户只能去改配置文件再重启。
+
+### `GET /admin/api/proxies` （保护）
+```json
+{ "success": true, "data": {
+  "proxies": [{
+    "id": "9f2c…", "index": 0, "address": "http://127.0.0.1:7890",
+    "pool": false, "source": "config", "managed": false, "enabled": true,
+    "healthy": true, "checking": false, "failures": 0, "cooldownUntil": null,
+    "lastError": "", "lastCheckedAt": null, "lastLatencyMs": null, "keys": 2
+  }],
+  "bindings": [{
+    "fp": "65b7…", "keyId": "k_1793102362780_1b2ab3", "index": 0,
+    "mode": "auto", "proxyId": "", "proxyIndex": 0,
+    "proxyAddress": "http://127.0.0.1:7890", "proxyHealthy": true, "failures": 0
+  }],
+  "proxyFile": "proxies.txt",
+  "proxyFileError": "",
+  "dataFile": "/app/data/proxies.json"
+} }
+```
+
+- `address` **永远是脱敏的**（只留 `host:port`）。列表里刻意不返回含口令的原串；
+  需要完整地址时走 `POST /proxies/reveal`（会记一条 `后台查看了代理明文` 日志）。
+- `pool: true` 表示轮换型代理池（`pool+` 前缀或 `#pool` 片段）。
+- `managed: false` 的条目没有删除按钮；`default` 来源连停用都没有。
+- `keys` 是当前绑在这一条上的 Key 数（含 auto 模式故障转移后的实际落点）。
+- `proxyFileError` 非空表示代理文件读不到 —— 池子仍然可用（其余来源照常），
+  但前端**必须**把原因显示出来，否则「我明明写了 proxyfile」会变成静默失效。
+- `bindings[].keyId` 是 Key 池里的 id，前端用它设置绑定；`proxyIndex: -1` 表示 `rotate`
+  模式（不静态绑定任何一条）。
+
+### `POST /admin/api/proxies` （保护）
+新增一条。请求体 `{ value }`；`value` 形如 `http://user:pass@host:port`、
+`pool+http://…`、`http://…#pool` 或 `direct`。校验失败返回 400 与可读原因。
+
+### `POST /admin/api/proxies/bulk` （保护）
+批量新增。请求体 `{ values: [...] }` 或 `{ text: "多行文本" }`（两者可同时给）。
+返回 `added` / `skipped`（重复）/ `invalid`（含原因）。**一行坏掉不影响其它行**，
+批内重复也会如实计入 `skipped`。单次上限 2000 条。
+
+### `POST /admin/api/proxies/update` （保护）
+`{ id, value }`。只有 `ui` 来源能改；地址变了 id 会跟着变（身份就是内容），
+指向旧地址的绑定会一起迁到新 id。
+
+### `POST /admin/api/proxies/delete` （保护）
+`{ ids: [...] }` 或 `{ id }`。只读来源会被跳过并如实回报；删除被绑定的代理时，
+相关绑定**自动退回 auto**，不留悬空引用。
+
+### `POST /admin/api/proxies/enabled` （保护）
+`{ ids: [...], enabled: true|false }`。对只读来源同样有效（停用记录落在 `data/proxies.json`）。
+
+### `POST /admin/api/proxies/test` （保护）
+`{ id }`。探测一条代理的连通性。**探测失败不是接口错误**：照样返回 200，
+由 `data.ok` 表达结果 —— 客户端需要拿到 `latencyMs` 与失败原因。
+判据是「有没有拿到任何 HTTP 响应」：401/403 也算通（隧道与 TLS 都成功了）。
+
+### `POST /admin/api/proxies/reveal` （保护）
+`{ id }`。返回含口令的完整地址。这是唯一会输出明文的接口，调用会记一条 warn 级日志。
+
+### `POST /admin/api/proxies/binding` （保护）
+设置某个上游 Key 的代理绑定。请求体 `{ keyId, mode, proxyId? }`：
+
+| mode | 含义 |
+|------|------|
+| `auto` | 静态 `i % N` 分配 + 故障转移 + 恢复后迁回（默认；未知值也归一到这里）|
+| `bind` | 固定到 `proxyId`，故障也不迁移。指向不存在或**已停用**的代理会被 400 拒绝 |
+| `rotate` | 每次尝试重新挑一条健康代理 |
+
+`keyId` 用 Key 池的 id；服务端自己换算成指纹，前端不必知道指纹怎么算。
+
+### 代理池的前端约定
+
+- 地址一律显示脱敏值；点行内 👁 才调 `reveal`，15 秒后自动重新脱敏。
+- 「测试」按钮进入 loading 态；结果就地显示连通/不可达、延迟与原因，并同步刷新该行状态。
+- 停用中的行整体置灰；「启用」「停用」按钮互斥显示，避免同时出现两个语义相反的按钮。
+- 批量操作（启用 / 停用 / 删除）在列表上方出现操作条，仅在有勾选时显示。
+- 绑定表按服务端给的 `keyId` 对齐 Key，**不能按下标对齐** ——
+  被禁用的 Key 不参与绑定，下标一旦错位就会把 A 的绑定画在 B 的行上。

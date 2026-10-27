@@ -11,6 +11,7 @@ const NAV = [
   { name: 'apiKeys', icon: '🔐', title: '2API Key' },
   { name: 'keys', icon: '🔑', title: '上游 Key' },
   { name: 'models', icon: '🧠', title: '模型' },
+  { name: 'proxies', icon: '🌐', title: '出站代理池' },
   { name: 'usage', icon: '📈', title: '用量' },
   { name: 'logs', icon: '📜', title: '请求日志' },
   { name: 'settings', icon: '⚙️', title: '设置' },

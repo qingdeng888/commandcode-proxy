@@ -1786,3 +1786,51 @@ test('CC_USE_PROVIDER_MODELS_WITH_PLAN_FILTER=true 才开启套餐过滤（默�
     assert.equal(cfg.settingSources.useProviderModelsWithPlanFilter, 'env');
   } finally { await proxy.kill(); await upstream.close(); }
 });
+
+// ── ⑭ 出站代理池的配置分层 ─────────────────────────────
+
+test('proxies / proxyFile 走配置分层：可热改、可落盘、非法地址被拒', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-proxycfg-'));
+  seedConfig(workdir);
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+    cwd: workdir,
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');
+
+    const c0 = (await (await api.get('/config')).json()).data;
+    assert.deepEqual(c0.proxies, [], '默认没有配置代理池');
+    assert.equal(c0.proxyFile, '');
+
+    // 非法地址被拒（而不是静默收下，等启动时才发现不可用）
+    const bad = await api.post('/config/update', { proxies: ['socks5://127.0.0.1:1080'] });
+    assert.equal(bad.status, 400);
+    assert.match((await bad.json()).error, /只支持 http/);
+
+    const bad2 = await api.post('/config/update', { proxies: ['not a url'] });
+    assert.equal(bad2.status, 400);
+
+    // 合法值：热改 + 落盘（只写改动字段）
+    const good = await api.post('/config/update', {
+      proxies: ['http://127.0.0.1:7890', 'pool+http://127.0.0.1:7891'],
+      proxyFile: 'proxies.txt',
+    });
+    assert.equal(good.status, 200);
+    const c1 = (await good.json()).data;
+    assert.deepEqual(c1.proxies, ['http://127.0.0.1:7890', 'pool+http://127.0.0.1:7891']);
+    assert.equal(c1.proxyFile, 'proxies.txt');
+
+    const settings = JSON.parse(readFileSync(join(workdir, 'data', 'settings.json'), 'utf-8'));
+    assert.deepEqual(settings.proxies, ['http://127.0.0.1:7890', 'pool+http://127.0.0.1:7891']);
+    assert.equal(settings.port, undefined, '只写改动过的字段');
+
+    // 代理池接口能看到这两条（config 来源，只读）
+    const pool = (await (await api.get('/proxies')).json()).data.proxies;
+    assert.ok(pool.some(t => t.address === 'http://127.0.0.1:7890'));
+    assert.ok(pool.some(t => t.address === 'http://127.0.0.1:7891' && t.pool === true));
+  } finally { await proxy.kill(); await upstream.close(); rmSync(workdir, { recursive: true, force: true }); }
+});

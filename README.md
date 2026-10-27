@@ -125,6 +125,7 @@ commandcode/
 │   ├── config.mjs        # Config load / hot reload / atomic write-back
 │   ├── store.mjs         # Atomic persistence (temp file + rename)
 │   ├── keys.mjs          # Key pool: rotation strategy, cooldown, usage, health
+│   ├── proxies.mjs       # Outbound proxy pool: entry parsing, health checks, key↔proxy binding
 │   ├── models.mjs        # Model catalog (upstream fetch + cache + static fallback) + test jobs
 │   ├── admin-auth.mjs    # Admin password (scrypt), sessions, login rate limiting
 │   ├── admin-api.mjs     # Admin REST API + SSE live logs
@@ -177,6 +178,9 @@ commandcode/
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
 | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
 | `webSearch` | `false` | Serve the Anthropic server tool `web_search_20250305` via Command Code's `/alpha/web-search` (see [Web search](#web-search-anthropic-server-tool)) |
+| `proxies` | `[]` | **Outbound proxy pool**: an array of `direct` / `http://user:pass@host:port` / `pool+http://…` (rotating pool) entries — see "Outbound proxy pool" below |
+| `proxyFile` | `""` | One entry per line, relative to the directory of `config.json` |
+| `upstreamProxy` | `""` | Legacy single-proxy field; still fully supported and joins the pool as a `legacy` entry |
 
 > 📌 `config.json` is **deployment-time input**. The panel (`/admin/`) writes to
 > `data/settings.json` and never rewrites this file — which is why it is safe to mount read-only
@@ -206,7 +210,7 @@ Every line in `.env.example` is commented; the common ones:
 | `ADMIN_PASSWORD` | **Panel password** (unset ⇒ the panel refuses all access) |
 | `PROXY_KEY` | Shared data-plane password (unnecessary once you use 2API keys) |
 | `CC_API_KEY` | Upstream keys, comma-separated (or add them in the panel) |
-| `CC_UPSTREAM_PROXY` | Route requests to the upstream through an HTTP proxy |
+| `CC_UPSTREAM_PROXY` | Route requests to the upstream through an HTTP proxy (legacy field; see "Outbound proxy pool") |
 | `CC_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `CC_DATA_DIR` | Runtime data directory (must be a volume under Docker) |
 | `PROXY_PORT` | Host port to publish (compose only) |
@@ -234,7 +238,12 @@ Every line in `.env.example` is commented; the common ones:
 | `CC_DATA_DIR` | `<project>/data` | Runtime data dir (key pool / admin password / test results). Mount a volume under Docker |
 | `CC_LOG_LEVEL` | `info` | Log level → `logLevel` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
-| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Outbound proxy pool" below → `upstreamProxy` |
+| `CC_PROXIES` | *(unset)* | Outbound proxy pool, comma separated (`pool+` / `#pool` rotate markers supported) → `proxies` |
+| `CC_PROXY_FILE` | *(unset)* | Path to a one-entry-per-line proxy file → `proxyFile` |
+| `CC_PROXY_HEALTH_INTERVAL_MS` | `900000` | How often unhealthy proxies are rechecked (15 min) |
+| `CC_PROXY_HEALTH_TIMEOUT_MS` | `10000` | Timeout of one health check (ms) |
+| `CC_PROXY_PROBE_TIMEOUT_MS` | `10000` | Timeout of one admin "test" probe (ms) |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
 | `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
@@ -322,24 +331,77 @@ you attach yourself are untouched.
 > Raise the budget if the model really needs every screenshot, but size memory as `budget × in-flight × 5–7`
 > (see [in-flight cap](#in-flight-cap-optional)).
 
-### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
+### Outbound proxy pool (`proxies` / `proxyFile` / `upstreamProxy`)
 
-Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.
+Route the requests the proxy makes **to Command Code** through one or more egresses — for egress-region switching, spreading accounts across IPs, or comparing IPs when debugging risk-control `403`s.
+
+Three configuration paths (all may be used together; they merge into one pool):
 
 ```json
-{ "upstreamProxy": "http://127.0.0.1:7890" }
+{
+  "proxies": [
+    "http://user:pass@127.0.0.1:7890",
+    "pool+http://user:pass@pool.example.com:8080",
+    "http://user:pass@1.2.3.4:8080#pool",
+    "direct"
+  ],
+  "proxyFile": "proxies.txt"
+}
 ```
 
 ```bash
+# comma separated; the file path can come from the environment too
+CC_PROXIES='http://127.0.0.1:7890,pool+http://pool.example.com:8080' npm start
+CC_PROXY_FILE=/etc/cc-proxies.txt npm start
+
+# legacy single-proxy field, still fully supported
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events` and `/provider/v1/models`.
+`proxyFile` holds one entry per line, relative to the directory of `config.json`; blank lines, a BOM and `#` / `;` / `//` comments are ignored (the `#pool` marker and the `//` of a URL are not comments).
+
+#### Rotating proxy pools (`pool+` / `#pool`)
+
+Prefix an entry with `pool+` or suffix it with `#pool` to declare a **rotating proxy pool** (such as [Resin](https://github.com/Resinat/Resin)), where every new TCP connection exits from a different IP. Both spellings are equivalent:
+
+```text
+pool+http://user:pass@pool.example.com:8080
+http://user:pass@pool.example.com:8080#pool
+```
+
+- A rotating entry **never records health**: its egress differs every time, so one failure says nothing about the pool.
+- Rotating entries are preferred for the "rotate per attempt" binding, so each attempt gets a fresh egress IP.
+
+#### Key ↔ proxy binding
+
+Each upstream key can choose which proxy carries it. Three modes, switchable on the admin **Outbound proxy pool** page:
+
+| Mode | Behaviour | When to use it |
+|---|---|---|
+| **auto** (default) | Static `i % N` assignment, moving to the least-loaded **healthy** proxy on failure, and moving back once it recovers | Almost always |
+| **bind** | Always the one you picked, never migrated even if it fails | When "this account must leave from this IP" |
+| **rotate** | A fresh healthy proxy per attempt | When you want a different IP every time |
+
+- Bindings live in `data/proxies.json`; `config.json` is never rewritten.
+- **Traffic is spread across every entry in the pool**: the default `auto` mode assigns `i % N`, so key 1 uses proxy 1, key 2 uses proxy 2, and so on. Configure a single entry if you want everything to leave from one place. Upgrading from the legacy single-proxy field keeps it in the pool as a `legacy` entry, which the first key keeps using.
+- Disabling or deleting a bound proxy **falls the binding back to auto** and says so — failing silently would be worse.
+- `bind` refuses a disabled proxy: pinning to one would mean that key can never leave.
+
+#### Health and failover
+
+- Every proxy tracks its own health, consecutive failures and cooldown. Only **route-level failures** (connection refused, tunnel timeout, TLS failure) count against a proxy — an upstream 4xx/5xx means the proxy worked and the problem is account- or model-level.
+- When a proxy is unreachable the proxy retries **the same key through another proxy**, not another key: switching keys cannot fix a dead proxy and would wrongly mark good accounts as failed.
+- The admin page can probe any proxy on demand; the test passes on **any HTTP response** (401/403 included).
+- A scheduled health check rechecks unhealthy proxies every 15 minutes by default (`CC_PROXY_HEALTH_INTERVAL_MS`), with probe timeouts of `CC_PROXY_HEALTH_TIMEOUT_MS` / `CC_PROXY_PROBE_TIMEOUT_MS` (10 s default).
+
+#### Coverage
+
+- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events`, `/provider/v1/models` and `/alpha/web-search`.
+- Routing a key's fingerprint/lifecycle pre-requests through **the same proxy as its generation** is deliberate: going out direct while generation used a proxy would make one account register from two different IPs — exactly the inconsistency you are trying to avoid.
 - **Does not** touch the local listener, `/health`, or the npm version check.
 - Only `http://` (CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https` reusing the same socket, so there is **no new dependency** and it works on Node 18+.
 - Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
-- Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
-- Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
+- Credentials in the proxy URL (`http://user:pass@host:port`) never appear in lists, logs or error messages: only `host:port` does. The admin page offers an explicit reveal (which writes an audit log line) when you need the full URL.
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
@@ -437,6 +499,7 @@ ADMIN_PASSWORD=your-admin-password npm start
 | 🔐 **2API Keys** | Calling credentials issued to **downstream clients**: generate, revoke individually, enable/disable, reveal, per-key request counts. The page opens with a "differences between the two key types" table |
 | 🔑 **Upstream Keys** | Command Code account credentials (`user_`): add/edit/delete, **one-click ⏸ disable / ▶ enable**, 👁 reveal, ⚡ real probe, import from `config`/`env`, rotation strategy |
 | 🧠 Models | **🔄 Sync upstream models**, **multi-select / select-all then batch enable or disable**, single-model test, batch test (limited concurrency, cancellable); only enabled models can be tested |
+| 🌐 **Outbound proxy pool** | Add / bulk-paste / enable / disable / **probe each proxy** / reveal credentials; **key ↔ proxy binding** (auto / bind / rotate), with health, consecutive failures, cooldown and how many keys each proxy carries |
 | 📈 Usage | Per-key requests / failures / tokens (today and total): **input split into cache hit / miss, output on its own**, resettable |
 | 📜 Request Log | **SSE live stream** (not polling) with pause, clear and level filter |
 | ⚙️ Settings | Hot-update runtime config (including the **default test model**), change the admin password |
@@ -621,6 +684,7 @@ Hand-editing `config.json` also hot-reloads (mtime polled every 3 s — more por
 | `data/api-keys.json` | **2API keys** (credentials issued to downstream clients, **plaintext**) | 600 |
 | `data/settings.json` | Settings changed from the panel (sparse overlay) | 600 |
 | `data/.admin-auth.json` | scrypt hash of the **admin panel** password | 600 |
+| `data/proxies.json` | Outbound proxy pool: admin-added entries, disabled-entry fingerprints, **key ↔ proxy bindings** | 600 |
 | `data/models.json` | Disabled model ids (sparse set) | 600 |
 | `data/model-tests.json` | Results of the last batch test | 600 |
 

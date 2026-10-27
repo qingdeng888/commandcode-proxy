@@ -21,6 +21,7 @@ import { CFG, DOTENV, startConfigWatcher } from './lib/config.mjs';
 import { DATA_DIR } from './lib/store.mjs';
 import { createLogBus, levelEnabled } from './lib/logbus.mjs';
 import { createKeyPool } from './lib/keys.mjs';
+import { createProxyPool, redactProxyUrl as redactPoolProxyUrl, parseProxyEntry } from './lib/proxies.mjs';
 import { createApiKeyPool, looksLikeUpstreamKey } from './lib/api-keys.mjs';
 import { createAdminAuth } from './lib/admin-auth.mjs';
 import { createModelCatalog, createModelTestRunner, classifyProbe } from './lib/models.mjs';
@@ -37,6 +38,19 @@ const logBus = createLogBus();
 
 // Key 池：视 UI Key + config/env Key 为一个轮询池
 const keyPool = createKeyPool({ log: (...args) => log(...args) });
+
+// 出站代理池：多代理 + 轮换池 + 与 Key 的绑定（auto / bind / rotate）。
+// keysProvider 让它始终看到 Key 池的当前形状（后台加 Key 后绑定表立即跟着更新）。
+const proxyPool = createProxyPool({
+  log: (...args) => log(...args),
+  keysProvider: () => keyPool.all().filter(e => e.enabled).map(e => e.key),
+  // 后台设置绑定用的是 Key 池的 id；这里把「Key 内容 → id」的换算放在一处，
+  // 免得前后端各自算一次指纹（两处实现早晚会漂移）。
+  keyIdFor: (key) => keyPool.idForKey(key),
+  // 健康探测目标用 /health 的语义：只要拿到**任何 HTTP 响应**就说明这条路通了。
+  // 打 /provider/v1/models 而不是某个需要 Key 的端点：401 也算通，且不会消耗额度。
+  probe: (t) => probeProxyRoute(t),
+});
 
 // 2API Key：本项目自己签发给**下游客户端**的凭证（与上游 Key 完全两套东西，见 lib/api-keys.mjs）
 const apiKeyPool = createApiKeyPool({ log: (...args) => log(...args) });
@@ -512,11 +526,15 @@ async function ensureInitialized(apiKey, signal) {
     };
     const fingerprint = state.fingerprint || {};
 
+    // 预请求与生成请求必须走**同一个 Key 的**同一条代理：否则同一账号会从两个
+    // 出口 IP 现身（指纹在这个 IP 注册、生成从那个 IP 发出），比不配代理更可疑。
+    const initProxy = proxyAddressFor(apiKey);
+
     await Promise.all([
       upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
-      }).then(r => {
+      }, initProxy).then(r => {
         if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status });
         else log('info', 'Fingerprint recorded');
       }).catch(e => {
@@ -534,7 +552,7 @@ async function ensureInitialized(apiKey, signal) {
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
-      }).then(r => {
+      }, initProxy).then(r => {
         if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status });
         else log('info', 'Lifecycle event sent');
       }).catch(e => {
@@ -597,10 +615,16 @@ const MODELS = [
 const catalog = createModelCatalog({
   staticModels: MODELS,
   log: (...args) => log(...args),
-  fetchImpl: (url, options) => upstreamFetch(url, {
-    ...options,
-    headers: { ...(options?.headers || {}), 'x-command-code-version': CC_VERSION },
-  }),
+  // 目录拉取也是一次带 Key 的上游请求 —— 走该 Key 绑定的那条代理，
+  // 否则「账号池全走代理 A，但模型列表从本机 IP 拉」会留下一个固定的旁路出口。
+  fetchImpl: (url, options) => {
+    const auth = String(options?.headers?.Authorization || options?.headers?.authorization || '');
+    const key = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    return upstreamFetch(url, {
+      ...options,
+      headers: { ...(options?.headers || {}), 'x-command-code-version': CC_VERSION },
+    }, key ? proxyAddressFor(key) : anyProxyAddress());
+  },
 });
 
 // 模型的启用/禁用状态（后台可批量改，落盘 data/models.json）。
@@ -795,7 +819,9 @@ async function probeModelInner({ key, model, message, mode = 'single' }) {
 
   try {
     await ensureInitialized(key);
-    const response = await forwardToCC(ccBody, key, {}, null, null);
+    // 模型测试同样是一次真实上游调用：走该 Key 绑定的那条代理，
+    // 否则「测试通过但实际请求走别的出口」会让人得出错误结论。
+    const response = await forwardToCC(ccBody, key, {}, null, null, proxyAddressFor(key));
     // 探测也是一次真实的上游调用，同样要计入该 Key 的用量 ——
     // 否则「我只在后台点测试」的用量会全部显示为 0（用户正是这么反馈的）
 
@@ -2045,9 +2071,12 @@ function headersToInit(raw) {
   return out;
 }
 
-/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
-async function proxyFetch(urlStr, options = {}) {
-  const proxy = parseProxyUrl(UPSTREAM_PROXY);
+/**
+ * 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body()）。
+ * proxyUrl 省略时用全局单代理（历史行为）；代理池为每次尝试传入自己那一条。
+ */
+async function proxyFetch(urlStr, options = {}, proxyUrl = null) {
+  const proxy = parseProxyUrl(proxyUrl || UPSTREAM_PROXY);
   const u = new URL(urlStr);
   const isTls = u.protocol === 'https:';
   const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
@@ -2124,10 +2153,70 @@ async function proxyFetch(urlStr, options = {}) {
 // URL 中的 user:pass 会转成 Proxy-Authorization），直接用它。
 const IS_BUN = !!process.versions.bun;
 
-/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
-function upstreamFetch(urlStr, options) {
-  if (!UPSTREAM_PROXY) return fetch(urlStr, options);
-  return IS_BUN ? fetch(urlStr, { ...options, proxy: UPSTREAM_PROXY }) : proxyFetch(urlStr, options);
+/**
+ * 上游请求入口。
+ *
+ * 代理来源优先级：显式传入的 proxy（代理池为本次尝试选的那一条）> 全局单代理
+ * upstreamProxy（历史字段，兼容旧部署）> 直连。显式传 `direct` 表示这条路由
+ * 明确不走任何代理 —— 与「没配代理」是同一条路径，但意图可读。
+ *
+ * 参数名刻意叫 proxyUrl 而不是 proxy：fetch 的 `proxy` 选项只有 Bun 认，
+ * 混在一起会让「我们自己的代理参数」和「Bun 的扩展」看起来是同一个东西。
+ */
+function upstreamFetch(urlStr, options, proxyUrl = null) {
+  const target = proxyUrl === null ? UPSTREAM_PROXY : proxyUrl;
+  if (!target || target === 'direct') return fetch(urlStr, options);
+  return IS_BUN ? fetch(urlStr, { ...options, proxy: target }) : proxyFetch(urlStr, options, target);
+}
+
+/**
+ * 探测一条代理路由是否可达。判据是「有没有拿到任何 HTTP 响应」：
+ * 401/403 说明隧道与 TLS 都通了，只是这个端点要鉴权 —— 那正是我们要的结论。
+ * 只有连接失败/超时才判定为这条代理坏了。
+ */
+async function probeProxyRoute(t) {
+  const url = `${CFG.apiBase}/provider/v1/models`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROXY_HEALTH_TIMEOUT_MS);
+  try {
+    const response = await upstreamFetch(url, {
+      method: 'GET',
+      headers: { 'x-command-code-version': CC_VERSION, 'User-Agent': 'cli' },
+      signal: controller.signal,
+    }, t.address);
+    try { await response.body?.cancel(); } catch {}
+    return { reachable: true, status: response.status };
+  } catch (e) {
+    return { reachable: false, error: e };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 代理探测超时。与 lib/proxies.mjs 的健康检查超时分开：探测自身要有硬上限。 */
+const PROXY_HEALTH_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_PROXY_PROBE_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 10000;
+})();
+
+/**
+ * 为某个 Key 挑一条代理，返回可直接交给 upstreamFetch 的地址（或 null = 直连）。
+ *
+ * 为什么预请求（指纹注册 / lifecycle）也要走同一个 Key 的代理：这两条请求是
+ * 「这台设备在这个 IP 上注册」的证据。生成请求走代理 A、预请求走直连或代理 B，
+ * 等于同一个账号同时从两个 IP 现身 —— 那比不配代理更糟。
+ */
+function proxyAddressFor(key, exclude = null) {
+  const t = proxyPool.choose(key, exclude);
+  return t ? t.address : null;
+}
+
+/** 与某个 Key 无关的外部请求（官方定价页等）：用第一条健康代理，失败则直连。 */
+function anyProxyAddress() {
+  const healthy = proxyPool.transports().find(t => t.enabled && t.healthy && !t.pool);
+  const poolEntry = proxyPool.transports().find(t => t.enabled && t.pool);
+  const chosen = healthy || poolEntry;
+  return chosen ? chosen.address : null;
 }
 
 /**
@@ -2136,8 +2225,19 @@ function upstreamFetch(urlStr, options) {
  * 要么走直连，不会出现「一半请求还在用旧代理」的中间态。
  */
 function refreshUpstreamProxy() {
+  // 代理池里的条目也可能变了（proxies / proxyFile / upstreamProxy 三个字段），
+  // 一并重建：否则用户改了 config.json 里的 proxies 却要重启才生效。
+  let poolChanged = false;
+  try {
+    const before = proxyPool.size;
+    proxyPool.reload();
+    poolChanged = proxyPool.size !== before;
+  } catch (e) {
+    log('warn', '代理池重建失败', { error: e.message });
+  }
+
   const next = CFG.upstreamProxy || '';
-  if (next === UPSTREAM_PROXY) return false;
+  if (next === UPSTREAM_PROXY) return poolChanged;
   const prev = UPSTREAM_PROXY;
   UPSTREAM_PROXY = next;
   log('info', '上游代理配置已更新', { from: redactProxyUrl(prev), to: redactProxyUrl(next) });
@@ -2146,7 +2246,7 @@ function refreshUpstreamProxy() {
 
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
+async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey, proxyUrl = null) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const { id: sessionId, source: sessionSource } = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
@@ -2193,7 +2293,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     // 见 serializeCcBody —— 带图长会话重新 stringify 一次要上百毫秒同步时间。
     body: serializeCcBody(body),
     signal,
-  });
+  }, proxyUrl);
 
   return response;
 }
@@ -2269,6 +2369,12 @@ async function drainErrorResponse(response) {
 async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, promptCacheKey) {
   const maxAttempts = Math.min(Math.max(keyPool.size, 1), MAX_KEY_ATTEMPTS);
   const tried = new Set();
+  // 本请求已经试过的**代理**（按池内 id）：一个代理连不上时换个代理再试一次，
+  // 但同一个代理不会在同一次请求里被重复选到。
+  const triedProxies = new Set();
+  // 换代理的次数上限：与池子大小同阶。没有它，一个「所有代理都不可达」的请求
+  // 会在 choose 反复返回同一条时原地打转。
+  let proxyAttempts = 0;
   let key = firstKey;
   // 输出上限降档只允许一次：上游亲口报出的上限收下之后重发同一请求，
   // 再被拒就是别的原因了，继续重试只会白烧额度。
@@ -2277,10 +2383,41 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
   for (let attempt = 1; ; attempt++) {
     tried.add(key);
     await ensureInitialized(key, signal);
+    // 每条 Key 的代理绑定：auto 静态绑定（故障时转移）/ bind 固定 / rotate 每次轮换
+    const transport = proxyPool.choose(key, triedProxies);
+    if (transport) triedProxies.add(transport.id);
     // let：输出上限降档分支会把消费过的响应换成还原出来的等价响应
-    let response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey);
+    let response;
+    try {
+      response = await forwardToCC(ccBody, key, incomingHeaders, signal, promptCacheKey,
+        transport ? transport.address : null);
+    } catch (e) {
+      // 路由层失败（连不上代理 / 隧道超时 / TLS 失败）：这才是代理的故障，
+      // 记一次失败让它进入冷却，然后换一条代理重试同一个 Key ——
+      // 换 Key 解决不了「代理挂了」，只会白白把好账号也标成失败。
+      //
+      // 注意不要把下一条代理预先加进 triedProxies：下一次循环顶部的 choose()
+      // 正是靠这个集合排除刚失败的那条来挑出下一条。预先加入会让两条都被排除，
+      // choose 返回 null —— 于是「重试」悄悄变成直连，把本该失败的请求放行。
+      proxyPool.markFailure(transport, e);
+      proxyAttempts++;
+      const nextProxy = proxyPool.choose(key, triedProxies);
+      const canRetry = nextProxy && nextProxy.id !== transport?.id
+        && proxyAttempts <= proxyPool.size;
+      if (canRetry) {
+        log('warn', '上游代理不可达，换一条代理重试', {
+          proxy: transport ? redactPoolProxyUrl(transport.value) : '(none)',
+          next: redactPoolProxyUrl(nextProxy.value),
+          error: e.message, attempt,
+        });
+        attempt--;   // 这不是「换了一个 Key」，不占用 Key 轮换次数
+        continue;
+      }
+      throw e;
+    }
 
     if (response.ok) {
+      proxyPool.markSuccess(transport);
       keyPool.recordRequest(key, { ok: true });
       return { response };
     }
@@ -2307,6 +2444,9 @@ async function forwardWithKeyRetry(ccBody, firstKey, incomingHeaders, signal, pr
       // 不是输出上限拒绝 → 把响应还原回去，继续走原来的分类逻辑
       response = restored;
     }
+
+    // 上游答了 HTTP 就说明这条路通了 —— 哪怕状态码是 4xx/5xx，也不是代理的问题。
+    proxyPool.markSuccess(transport);
 
     // 状态码本身不值得换 Key，或已达尝试上限 → 记一次失败后交调用方处理
     if (attempt >= maxAttempts || !RETRYABLE_KEY_STATUS.has(response.status)) {
@@ -2450,7 +2590,7 @@ async function executeWebSearch(query, apiKey, incomingHeaders = {}, signal, opt
       signal: combined,
       // 多要几条抵消被剥掉的广告
       body: JSON.stringify({ query: query.trim(), numResults: Math.min(10, want + 3) }),
-    });
+    }, proxyAddressFor(apiKey));
     if (!r.ok) {
       log('warn', 'Web search upstream error', { status: r.status });
       return { errorCode: r.status === 429 ? 'too_many_requests' : 'unavailable' };
@@ -4327,7 +4467,7 @@ async function fetchPlanId(apiKey) {
   const subscription = await upstreamFetch(`${CFG.apiBase}/alpha/billing/subscriptions`, {
     headers: { 'x-api-key': apiKey },
     signal: AbortSignal.timeout(10000),
-  });
+  }, proxyAddressFor(apiKey));
   if (!subscription.ok) throw httpStatusError('subscription', subscription);
   const subscriptionBody = await subscription.json();
   // 成功响应但没有 planId（如无订阅）是有效结果，照常缓存，不当失败处理
@@ -4336,10 +4476,11 @@ async function fetchPlanId(apiKey) {
 }
 
 async function fetchPricingRowsOnce() {
+  // 官方定价页与账号无关：用任意一条健康代理即可（没有代理时直连）
   const pricing = await upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
     headers: { rsc: '1' },
     signal: AbortSignal.timeout(10000),
-  });
+  }, anyProxyAddress());
   if (!pricing.ok) throw httpStatusError('pricing', pricing);
   const rows = extractPricingRows(await pricing.text());
   if (!rows.length) throw new NonRetryableError('pricing model rows not recognized');
@@ -5388,6 +5529,7 @@ const adminApi = createAdminApi({
   // 测试消息的默认值与上限：由这里注入，后台只要读取即可（避免默认值写两份）
   testMessage: { default: DEFAULT_TEST_MESSAGE, maxLen: MAX_TEST_MESSAGE_LEN },
   startedAt: SERVER_STARTED_AT,
+  proxies: proxyPool,
   reloadUpstreamProxy: refreshUpstreamProxy,
   getInflight: () => inflightCount,
   get address() { return `http://${CFG.host}:${CFG.port}`; },
@@ -5524,6 +5666,8 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health 与 /admin/* 豁免)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    proxyPool: `${proxyPool.size} 条（健康 ${proxyPool.list().filter(t => t.healthy).length}）`
+      + (proxyPool.file ? ` · 代理文件 ${proxyPool.file}` : ''),
     dataDir: DATA_DIR,
     // 明确说出 .env 有没有被读到、读了哪些键（值不打印，里面有密码）。
     // 容器里必然是「未找到」—— Docker 下 .env 由 compose 在宿主侧读取后作为真实环境变量注入，

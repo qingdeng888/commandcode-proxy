@@ -262,6 +262,14 @@ onMounted(() => {
           <dd>{{ config ? (config.useProviderModelsWithPlanFilter ? '是' : '否') : '-' }}</dd>
           <dt>服务端 web_search</dt>
           <dd>{{ config ? (config.webSearch ? '由代理代执行' : '剥掉') : '-' }}</dd>
+          <dt>出站代理池</dt>
+          <dd>
+            <router-link to="/proxies">🌐 出站代理池</router-link>
+            <span class="hint" style="margin-left: 6px">
+              config.json {{ config && config.proxies ? config.proxies.length : 0 }} 条
+              <template v-if="config && config.proxyFile"> · 文件 {{ config.proxyFile }}</template>
+            </span>
+          </dd>
           <dt>模型刷新间隔</dt>
           <dd class="mono">
             {{ config && config.modelRefreshIntervalMs ? fmtNum(Math.round(config.modelRefreshIntervalMs / 1000)) + ' 秒' : '-' }}

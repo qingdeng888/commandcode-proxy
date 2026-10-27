@@ -117,6 +117,7 @@ commandcode/
 │   ├── config.mjs        # 配置加载 / 热加载 / 原子写回
 │   ├── store.mjs         # 原子持久化（临时文件 + rename）
 │   ├── keys.mjs          # Key 池：轮询策略、冷却、用量、健康
+│   ├── proxies.mjs       # 出站代理池：条目解析、健康检查、Key ↔ 代理绑定
 │   ├── models.mjs        # 模型目录（上游拉取 + 缓存 + 静态回退）+ 测试任务
 │   ├── admin-auth.mjs    # 后台密码（scrypt）、会话、登录限速
 │   ├── admin-api.mjs     # 后台 REST API + SSE 实时日志
@@ -171,6 +172,9 @@ commandcode/
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
 | `webSearch` | `false` | 由代理经 Command Code 的 `/alpha/web-search` 执行 Anthropic 服务端工具 `web_search_20250305`，见下文「Web search」一节 |
+| `proxies` | `[]` | **出站代理池**：数组，每条可以是 `direct` / `http://user:pass@host:port` / `pool+http://…`（轮换池），见下文「出站代理池」|
+| `proxyFile` | `""` | 每行一条代理的文件；相对路径按 `config.json` 所在目录解析 |
+| `upstreamProxy` | `""` | 历史单代理字段，仍然完全有效；会作为一条 `legacy` 来源加入代理池 |
 
 > 📌 `config.json` 是**部署期输入**。后台（`/admin/`）改动的是 `data/settings.json`，
 > 不会改写这个文件 —— 所以 Docker 里它可以安全地只读挂载。分层优先级见 [Web 管理后台](#web-管理后台)。
@@ -198,7 +202,7 @@ docker compose up -d
 | `ADMIN_PASSWORD` | **后台访问密码**（不设则后台整体拒绝访问）|
 | `PROXY_KEY` | 数据面共享口令（用了 2API Key 就不需要它）|
 | `CC_API_KEY` | 上游 Key，多个用逗号分隔（也可在后台添加）|
-| `CC_UPSTREAM_PROXY` | 让发往上游的请求走 HTTP 代理 |
+| `CC_UPSTREAM_PROXY` | 让发往上游的请求走 HTTP 代理（历史字段，见「出站代理池」）|
 | `CC_LOG_LEVEL` | 日志级别 `debug/info/warn/error` |
 | `CC_DATA_DIR` | 运行时数据目录（Docker 必须挂卷）|
 | `PROXY_PORT` | 宿主机映射端口（仅 compose 读取）|
@@ -223,7 +227,12 @@ docker compose up -d
 | `CC_LOG_LEVEL` | `info` | 日志级别 → `logLevel` |
 | `ADMIN_COOKIE_SECURE` | 空 | `1` 时给后台会话 Cookie 加 `Secure`（仅在 HTTPS 下开启，否则浏览器不回传 Cookie）|
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
-| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「出站代理池」→ `upstreamProxy` |
+| `CC_PROXIES` | 空 | 出站代理池，逗号分隔（支持 `pool+` / `#pool` 轮换池标记）→ `proxies` |
+| `CC_PROXY_FILE` | 空 | 代理文件路径（每行一条）→ `proxyFile` |
+| `CC_PROXY_HEALTH_INTERVAL_MS` | `900000` | 定时复查不健康代理的间隔（15 分钟）|
+| `CC_PROXY_HEALTH_TIMEOUT_MS` | `10000` | 健康检查单次超时（毫秒）|
+| `CC_PROXY_PROBE_TIMEOUT_MS` | `10000` | 后台「测试」按钮的单次探测超时（毫秒）|
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
 | `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
@@ -400,24 +409,88 @@ CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # 可选：改
 
 > 想让模型看到全部截图就调大预算，但请按 `预算 × 并发 × 5~7` 估内存（并发见[在途上限](#在途请求上限可选)）。
 
-### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
+### 出站代理池（`proxies` / `proxyFile` / `upstreamProxy`）
 
-让代理**发往 Command Code 的请求**走本地 HTTP 代理 —— 用于出口地区调整，或排查风控 `403` 时做 IP 维度对照。
+让代理**发往 Command Code 的请求**走一个或多个出口 —— 用于出口地区调整、把多个账号分散到不同 IP，
+或排查风控 `403` 时做 IP 维度对照。
+
+三条配置路径（可以同时用，最终合并成同一个池子）：
 
 ```json
-{ "upstreamProxy": "http://127.0.0.1:7890" }
+{
+  "proxies": [
+    "http://user:pass@127.0.0.1:7890",
+    "pool+http://user:pass@pool.example.com:8080",
+    "http://user:pass@1.2.3.4:8080#pool",
+    "direct"
+  ],
+  "proxyFile": "proxies.txt"
+}
 ```
 
 ```bash
+# 逗号分隔；文件路径也可用环境变量给
+CC_PROXIES='http://127.0.0.1:7890,pool+http://pool.example.com:8080' npm start
+CC_PROXY_FILE=/etc/cc-proxies.txt npm start
+
+# 历史字段：单代理，仍然完全有效
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events` 与 `/provider/v1/models`。
+`proxyFile` 每行一条，相对路径按 `config.json` 所在目录解析；空行、BOM 与 `#` / `;` / `//` 起的注释都忽略
+（`#pool` 与 URL 里的 `//` 不受影响）。
+
+#### 轮换型代理池（`pool+` / `#pool`）
+
+给一条地址加 `pool+` 前缀或 `#pool` 片段，就声明它是**轮换型代理池**（[Resin](https://github.com/Resinat/Resin) 这类：
+每条新 TCP 连接出口 IP 都不同）。两种写法完全等价：
+
+```text
+pool+http://user:pass@pool.example.com:8080
+http://user:pass@pool.example.com:8080#pool
+```
+
+- 轮换池条目**永不记健康状态**：它的出口每次都不同，一次失败说明不了那条池子坏了。
+- 轮换池条目会被优先用于「每次轮换」绑定，让每次尝试都拿到一个新的出口 IP。
+
+#### Key ↔ 代理绑定
+
+每个上游 Key 可以单独指定它从哪条代理出去。三种模式（后台「出站代理池」页可改）：
+
+| 模式 | 行为 | 什么时候用 |
+|---|---|---|
+| **自动**（默认） | 按 `i % N` 静态分配，代理故障时转移到最空闲的**健康**代理，代理恢复后自动迁回 | 大多数情况 |
+| **固定** | 始终走指定的那一条，故障也不迁移 | 要保证「这个号只从这个 IP 出去」 |
+| **每次轮换** | 每次尝试都重新挑一条健康代理 | 要的就是每次换 IP |
+
+- 绑定关系存在 `data/proxies.json`，**不改写 `config.json`**。
+- **池子里有几条，流量就会分摊到几条**：默认的 `auto` 是 `i % N` 静态分配，
+  所以第 1 个 Key 走第 1 条、第 2 个 Key 走第 2 条……想全部走一条就把池子配成一条。
+  从旧的单代理字段升级过来时它作为 `legacy` 来源留在池子里，第一个 Key 仍然用它。
+- 被绑定的代理被停用或删除时，绑定**自动退回「自动」**并明确提示 —— 静默失效比退回更糟。
+- `bind` 模式拒绝指向已停用的代理（那等于让这个 Key 永远出不去）。
+
+#### 健康与故障转移
+
+- 每条代理独立记录健康状态、连续失败次数与冷却时间；只有**路由层失败**（连不上、隧道超时、TLS 失败）
+  才算代理故障 —— 上游返回 4xx/5xx 说明代理是通的，那是账号/模型维度的问题，不惩罚代理。
+- 一条代理连不上时，**同一个 Key 换一条代理重试**（而不是换 Key）：换 Key 解决不了「代理挂了」，
+  只会白白把好账号也标成失败。
+- 后台可以随时点「🔍 测试」单测一条代理：判据是**有没有拿到任何 HTTP 响应**（401/403 也算通）。
+- 定时健康检查默认每 15 分钟复查一次不健康的代理（`CC_PROXY_HEALTH_INTERVAL_MS` 可调），
+  探测超时 `CC_PROXY_HEALTH_TIMEOUT_MS` / `CC_PROXY_PROBE_TIMEOUT_MS`（默认 10 秒）。
+
+#### 覆盖范围
+
+- 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events`、`/provider/v1/models`
+  与 `/alpha/web-search`。
+- **指纹/lifecycle 预请求与该 Key 的生成请求走同一条代理**是刻意的：若预请求直连而上游生成走代理，
+  同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
 - **不影响**本地监听、`/health` 与 npm 版本检查。
 - 仅支持 `http://`（CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
 - 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按**目标主机名**校验，绝不针对代理降级。
-- **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
-- 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
+- 代理地址里带账号密码（`http://user:pass@host:port`）时，列表、日志与错误消息只保留 `host:port`，
+  **不打印口令**；需要完整地址时后台提供显式的「👁 查看明文」（会记一条日志）。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
 
@@ -450,6 +523,7 @@ ADMIN_PASSWORD=你的管理密码 npm start
 | 🔐 **2API Key** | 签发给**下游客户端**的调用凭证：生成 / 逐个吊销 / 启停 / 揭示明文 / 请求计数；页面顶部直接说明「两套 Key 的区别」|
 | 🔑 **上游 Key** | Command Code 账号凭证（`user_`）：增删改查、**一键 ⏸ 停用 / ▶ 启用**、👁 揭示明文、⚡ 真实探测、从 `config`/`env` 导入、切换轮询策略 |
 | 🧠 模型 | **🔄 同步上游模型**、**多选/全选后批量启用或禁用**、单模型测试、批量测试（受限并发 + 可取消）；只能测启用中的模型 |
+| 🌐 **出站代理池** | 代理条目增删改查 / 批量粘贴 / 启停 / **逐个连通性测试** / 明文揭示；**Key ↔ 代理绑定**（自动 / 固定 / 每次轮换），每条代理显示健康、连续失败、冷却与绑定了几个 Key |
 | 📈 用量 | 按 Key 的请求数 / 失败数 / Token（今日与累计）：**输入拆成缓存命中 / 未命中，输出单列**，可重置 |
 | 📜 请求日志 | **SSE 实时推送**（非轮询），可暂停、清屏、按级别过滤 |
 | ⚙️ 设置 | 运行配置热更新（含**默认测试模型**）、修改后台密码 |
@@ -640,6 +714,7 @@ ADMIN_PASSWORD=你的管理密码 npm start
 | `data/api-keys.json` | **2API Key**（签发给下游客户端的凭证，**明文**）| 600 |
 | `data/settings.json` | 后台改过的设置（稀疏覆盖）| 600 |
 | `data/.admin-auth.json` | **后台密码**的 scrypt 哈希 | 600 |
+| `data/proxies.json` | 出站代理池：后台添加的条目、被停用的条目指纹、**Key ↔ 代理绑定** | 600 |
 | `data/models.json` | 被禁用的模型 id（稀疏集合）| 600 |
 | `data/model-tests.json` | 最近一次批量模型测试结果 | 600 |
 

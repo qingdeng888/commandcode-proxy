@@ -6,6 +6,7 @@ import DashboardView from './views/DashboardView.vue'
 import KeysView from './views/KeysView.vue'
 import ApiKeysView from './views/ApiKeysView.vue'
 import ModelsView from './views/ModelsView.vue'
+import ProxiesView from './views/ProxiesView.vue'
 import UsageView from './views/UsageView.vue'
 import LogsView from './views/LogsView.vue'
 import SettingsView from './views/SettingsView.vue'
@@ -28,6 +29,7 @@ const routes = [
       { path: 'api-keys', name: 'apiKeys', component: ApiKeysView, meta: { title: '2API Key' } },
       { path: 'keys', name: 'keys', component: KeysView, meta: { title: '上游 Key' } },
       { path: 'models', name: 'models', component: ModelsView, meta: { title: '模型' } },
+      { path: 'proxies', name: 'proxies', component: ProxiesView, meta: { title: '出站代理池' } },
       { path: 'usage', name: 'usage', component: UsageView, meta: { title: '用量' } },
       { path: 'logs', name: 'logs', component: LogsView, meta: { title: '请求日志' } },
       { path: 'settings', name: 'settings', component: SettingsView, meta: { title: '设置' } },
