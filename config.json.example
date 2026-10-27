@@ -1,18 +1,1 @@
-{
-  "port": 3050,
-  "host": "0.0.0.0",
-  "proxyKey": "",
-  "apiKey": "",
-  "apiBase": "https://api.commandcode.ai",
-  "projectSlug": "cc-proxy",
-  "logFile": "",
-  "logLevel": "info",
-  "zdr": false,
-  "upstreamProxy": "",
-  "strategy": "round_robin",
-  "defaultModel": "",
-  "fingerprintSalt": "",
-  "deviceProjectDir": "",
-  "cliMode": "agent",
-  "cliSessionMode": "interactive"
-}
+{"port":3050,"host":"0.0.0.0","proxyKey":"","apiKey":"","apiBase":"https://api.commandcode.ai","projectSlug":"cc-proxy","logFile":"","logLevel":"info","useProviderModels":true,"useProviderModelsWithPlanFilter":false,"webSearch":false,"zdr":false,"upstreamProxy":"","strategy":"round_robin","defaultModel":"","fingerprintSalt":"","deviceProjectDir":"","cliMode":"agent","cliSessionMode":"interactive"}

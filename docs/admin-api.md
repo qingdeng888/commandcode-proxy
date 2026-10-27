@@ -92,7 +92,7 @@
 ### `GET /admin/api/stats` （保护）
 ```json
 { "success": true, "data": {
-  "version": "1.1.0",
+  "version": "1.3.0",
   "uptimeSec": 1234,
   "strategy": "round_robin",
   "keys":    { "total": 3, "enabled": 3, "cooldown": 0, "unhealthy": 0 },
@@ -358,11 +358,12 @@ Key 列表项（下称 `KeyItem`）：
   "port": 3050, "host": "0.0.0.0", "apiBase": "https://api.commandcode.ai",
   "projectSlug": "cc-proxy", "proxyKeySet": true,
   "zdr": false, "logLevel": "info", "logFile": "",
-  "useProviderModels": true, "modelRefreshIntervalMs": 300000,
+  "useProviderModels": true, "useProviderModelsWithPlanFilter": false,
+  "webSearch": false, "modelRefreshIntervalMs": 300000,
   "upstreamProxy": "", "strategy": "round_robin", "defaultModel": "deepseek/deepseek-v4-flash",
   "dataDir": "/app/data", "configPath": "/app/config.json",
   "settingsPath": "/app/data/settings.json",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "envLocked": ["logLevel"],
   "settingSources": { "strategy": "settings", "logLevel": "env", "port": "config" },
   "defaultTestMessage": "你是谁，出来干活了",

@@ -1707,3 +1707,82 @@ test('日志接口返回运行日志，级别过滤生效', async () => {
     assert.ok(onlyError.every(l => l.level === 'error'), 'level=error 只能返回 error 级');
   } finally { await s.close(); }
 });
+
+// ── ⑬ 上游 PR 合并进来的两个开关（#53 套餐过滤 / #46 web_search）──
+//
+// 这两个字段是随上游 PR 合并进来的，但它们在本 fork 里的**落点是 lib/config.mjs**
+// （原 PR 自带一套 proxy.mjs 内的 loadConfig()，与本 fork 的配置分层冲突）。
+// 因此必须验证它们真的走通了分层：能读、能热改、能落盘、环境变量能锁定。
+
+test('useProviderModelsWithPlanFilter 与 webSearch 走配置分层：可读、可热改、可落盘', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-newcfg-'));
+  seedConfig(workdir);
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS: 'true' },
+    cwd: workdir,
+  });
+  try {
+    const api = await authed(proxy);
+    await api.get('/models');
+
+    // 默认值：两个开关都关（都不改变既有行为）
+    const c0 = (await (await api.get('/config')).json()).data;
+    assert.equal(c0.useProviderModelsWithPlanFilter, false, '套餐过滤默认关');
+    assert.equal(c0.webSearch, false, 'web_search 代执行默认关');
+
+    // 热改两个开关
+    const r = await api.post('/config/update', {
+      useProviderModelsWithPlanFilter: true,
+      webSearch: true,
+    });
+    assert.equal(r.status, 200);
+    const c1 = (await r.json()).data;
+    assert.equal(c1.useProviderModelsWithPlanFilter, true);
+    assert.equal(c1.webSearch, true);
+
+    // 立即生效（读回确认）
+    const c2 = (await (await api.get('/config')).json()).data;
+    assert.equal(c2.webSearch, true, '热改后立刻生效');
+
+    // 落盘到 data/settings.json，且只写这两个字段
+    const settings = JSON.parse(readFileSync(join(workdir, 'data', 'settings.json'), 'utf-8'));
+    assert.equal(settings.webSearch, true);
+    assert.equal(settings.useProviderModelsWithPlanFilter, true);
+    assert.equal(settings.port, undefined, '只写改动过的字段');
+  } finally { await proxy.kill(); await upstream.close(); rmSync(workdir, { recursive: true, force: true }); }
+});
+
+test('webSearch 被环境变量锁定时后台改不动（CC_WEB_SEARCH 优先）', async () => {
+  const upstream = await startCatalogUpstream();
+  // CC_WEB_SEARCH 只认 '1' 为真 —— 与上游 PR 的口径一致
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_WEB_SEARCH: '1' },
+  });
+  try {
+    const api = await authed(proxy);
+    const c0 = (await (await api.get('/config')).json()).data;
+    assert.equal(c0.webSearch, true, 'CC_WEB_SEARCH=1 应打开');
+
+    const r = await api.post('/config/update', { webSearch: false });
+    assert.equal(r.status, 200);
+    const c1 = (await (await api.get('/config')).json()).data;
+    assert.equal(c1.webSearch, true, '环境变量锁定的字段，后台改不动');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+
+test('CC_USE_PROVIDER_MODELS_WITH_PLAN_FILTER=true 才开启套餐过滤（默认不开启）', async () => {
+  const upstream = await startCatalogUpstream();
+  const proxy = await startProxy({
+    upstreamPort: upstream.port,
+    env: { ...BASE_ENV, CC_API_KEY: CATALOG_KEY, CC_USE_PROVIDER_MODELS_WITH_PLAN_FILTER: 'true' },
+  });
+  try {
+    const api = await authed(proxy);
+    const cfg = (await (await api.get('/config')).json()).data;
+    assert.equal(cfg.useProviderModelsWithPlanFilter, true);
+    assert.equal(cfg.settingSources.useProviderModelsWithPlanFilter, 'env');
+  } finally { await proxy.kill(); await upstream.close(); }
+});

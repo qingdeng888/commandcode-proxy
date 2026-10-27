@@ -72,6 +72,31 @@
   故改为按上游错误码就地分类。
 - **Cline 的账号刷新令牌机制不适用**：CC 用的是静态 `user_` Key。
 
+### 5.1 从上游 PR 里挑着合并（2026-10-27）
+
+上游 `master` 本身停在 `972828a`（2026-10-09），本 fork 早已包含它；那之后上游的动静全在
+**开放 PR** 与 `test*` 分支里。逐个体检后合了四个 PR，另外几个明确不合：
+
+| 来源 | 结论 | 理由 |
+|---|---|---|
+| PR #64 | 合 | 纯文档：修掉「session 过期 12h 换机器」的过时描述（该 store 已随 #29 移除） |
+| PR #59 | 合 | 纯文档：补上流内 `error` 事件的 `statusCode` 会被采纳并映射的说明 |
+| PR #68 | 合 | 真实拒绝：取消/部分响应的轮次没有 reasoning，严格上游报 `Missing required parameter` |
+| PR #53 | 合（改接） | 按套餐过滤模型列表；原 PR 自带一套 `loadConfig()` + 目录缓存，与本 fork 的 `lib/config.mjs` + `lib/models.mjs` 冲突，只保留算法部分 |
+| PR #46 | 合（改接） | 服务端 `web_search`；同样去掉它自带的 `loadConfig()`，并把 `webSearch` 接进配置分层 |
+| #44 / #35 / #5 | 不合 | 内容已在 HEAD：Content-Length 预检、cpuCount=threads、cache_control 保留 |
+| #12 / #27 | 不合 | 与既有实现重复或冲突：#12 的额度归一化已有更细的分类，#27 的 console 与本 fork 的 `lib/` + `web/` 是两套 |
+| `test` / `test-pr5*` 分支 | 不合 | 是上游的实验分支，最终形态已通过 `master` 与 PR 表达 |
+
+合并 PR #68 时有一个**语义交叉**必须处理：该 PR 早先的版本在「历史缺 reasoning」时会
+**扣下 `reasoning_effort`**（等于牺牲当前轮推理），最终版改成回填非空占位符。本 fork 采用
+最终版 —— 占位符是诚实的标记文本（`[reasoning unavailable: previous turn was interrupted]`），
+真实值一律原样保留。
+
+合并 PR #46 时另有一处**与既有优化的直接冲突**：issue #20 曾在 `buildCcRequest` 之后
+把 `openaiReq` 置空以尽早回收那棵 20MB 级对象树，而搜索循环要往它的 `messages` / `tools`
+上追加历史并重建 `ccBody`。取舍是保留 `openaiReq`（搜索循环需要），只断开 `anthropicReq`。
+
 ## 6. 协议保真（wire fidelity）
 
 协议约定的唯一来源是官方 npm 包 `command-code` 的 `dist/cli.mjs`（压缩但未混淆）。

@@ -260,6 +260,8 @@ onMounted(() => {
           <dd>{{ config ? (config.useProviderModels ? '是' : '否') : '-' }}</dd>
           <dt>按套餐过滤模型</dt>
           <dd>{{ config ? (config.useProviderModelsWithPlanFilter ? '是' : '否') : '-' }}</dd>
+          <dt>服务端 web_search</dt>
+          <dd>{{ config ? (config.webSearch ? '由代理代执行' : '剥掉') : '-' }}</dd>
           <dt>模型刷新间隔</dt>
           <dd class="mono">
             {{ config && config.modelRefreshIntervalMs ? fmtNum(Math.round(config.modelRefreshIntervalMs / 1000)) + ' 秒' : '-' }}
