@@ -32,7 +32,8 @@ const state = reactive({
 const addForm = reactive({ value: '' })
 const bulkText = ref('')
 const bulkOpen = ref(false)
-const busy = reactive({ add: false, bulk: false, rowId: '', testingId: '', savingId: '' })
+const busy = reactive({ add: false, bulk: false, rowId: '', testingId: '', savingId: '', batch: false })
+const batchProgress = ref('')
 const editing = reactive({ id: '', value: '' })
 const revealed = reactive({})
 const testResults = reactive({})
@@ -194,6 +195,38 @@ async function test(t) {
   }
 }
 
+/**
+ * 批量测试选中的代理。走服务端的 /proxies/test-batch 而不是前端 for 循环逐条调：
+ * 并发由服务端统一控制（默认 4），结果一次返回完整一张表 ——
+ * 前端循环会在中途遇到限流/超时后留下半张表，用户不知道剩下的是「没测」还是「测失败了」。
+ */
+async function testSelected() {
+  const ids = [...selected.value]
+  if (!ids.length) {
+    toast.error('请先勾选要测试的代理')
+    return
+  }
+  busy.batch = true
+  // 不画「1/N」的假进度：服务端一次调用跑完再返回，前端并不知道当前走到第几条。
+  // 与其显示一个永远停在 0/N 的计数器，不如如实说「正在测 N 条」。
+  batchProgress.value = `正在测试 ${ids.length} 条…`
+  try {
+    const { data, message } = await api('POST', '/proxies/test-batch', { ids })
+    applyPayload(data)
+    for (const r of (data.results || [])) {
+      testResults[r.id] = { ok: r.ok, latencyMs: r.latencyMs, error: r.error, status: r.status, at: Date.now() }
+    }
+    const s = data.summary || {}
+    if (s.failed) toast.error(message || `测试完成：${s.ok}/${s.total} 条连通`)
+    else toast.success(message || `测试完成：${s.ok}/${s.total} 条连通`)
+  } catch (e) {
+    toast.error('批量测试失败：' + e.message)
+  } finally {
+    busy.batch = false
+    batchProgress.value = ''
+  }
+}
+
 async function reveal(t) {
   busy.rowId = t.id
   try {
@@ -344,10 +377,15 @@ onMounted(async () => {
       </div>
       <div v-if="selected.length" class="section-body" style="padding-bottom: 0">
         <div class="flex" style="gap: 8px; align-items: center; flex-wrap: wrap">
+          <button class="btn btn-sm btn-primary" type="button" :disabled="busy.batch" @click="testSelected">
+            <span v-if="busy.batch" class="loading" style="border-top-color: #04121a"></span>
+            {{ busy.batch ? '测试中…' : '🔍 测试所选' }}
+          </button>
           <button class="btn btn-sm" type="button" :disabled="busy.rowId === 'bulk'" @click="setEnabledForSelection(true)">✅ 启用所选</button>
           <button class="btn btn-sm" type="button" :disabled="busy.rowId === 'bulk'" @click="setEnabledForSelection(false)">⏸ 停用所选</button>
           <button class="btn btn-sm btn-danger" type="button" :disabled="busy.rowId === 'bulk'" @click="removeMany([...selected])">🗑 删除所选</button>
           <button class="btn btn-sm" type="button" @click="selected = []">取消选择</button>
+          <span v-if="batchProgress" class="hint" role="status">{{ batchProgress }}</span>
         </div>
       </div>
       <div class="table-wrap">

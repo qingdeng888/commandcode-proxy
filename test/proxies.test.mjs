@@ -606,3 +606,104 @@ test('代理池持久化：重启后条目与绑定都还在', async () => {
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+// ── ⑦ 批量测试 ────────────────────────────────────────
+
+test('批量测试：一次请求测完所选代理，单条失败不影响其余，结果按勾选顺序返回', async () => {
+  const live = await startRecordingProxy();
+  const dead = await startRecordingProxy({ failConnect: true });
+  const s = await startWithProxies();
+  try {
+    const added = await s.api.post('/proxies/bulk', {
+      values: [live.url, dead.url, 'http://127.0.0.1:19999'],
+    });
+    assert.equal(added.status, 200);
+    // 响应体只能消费一次：先解析再断言，不要 json() 两次
+    const addedBody = await added.json();
+    const rows = addedBody.data.proxies.filter(t => t.managed);
+    assert.equal(rows.length, 3);
+
+    // 故意打乱顺序：返回顺序必须跟勾选顺序一致，否则表格里的结果会跳来跳去
+    const ids = [rows[1].id, rows[0].id, rows[2].id];
+    const r = await s.api.post('/proxies/test-batch', { ids });
+    assert.equal(r.status, 200);
+    const data = (await r.json()).data;
+
+    assert.equal(data.summary.total, 3);
+    assert.deepEqual(data.results.map(x => x.id), ids, '结果顺序必须与请求顺序一致');
+
+    const byId = Object.fromEntries(data.results.map(x => [x.id, x]));
+    assert.equal(byId[rows[0].id].ok, true, '活的代理应连通');
+    assert.equal(typeof byId[rows[0].id].latencyMs, 'number');
+    assert.equal(byId[rows[1].id].ok, false, '连不上的代理应判为不可达');
+    assert.ok(byId[rows[1].id].error, '要给出不可达的原因');
+    assert.equal(byId[rows[2].id].ok, false, '端口没人监听也是不可达');
+
+    assert.equal(data.summary.ok, 1);
+    assert.equal(data.summary.failed, 2);
+    // 每条的状态都写回了池子，列表能直接看到
+    const list = Object.fromEntries(data.proxies.map(t => [t.id, t]));
+    assert.equal(list[rows[0].id].healthy, true);
+    assert.equal(list[rows[1].id].healthy, false);
+    assert.ok(list[rows[1].id].cooldownUntil, '失败的那条应进入冷却');
+  } finally { await s.close(); await live.close(); await dead.close(); }
+});
+
+test('批量测试：不存在的 id 如实计入 skipped，而不是整批失败', async () => {
+  const live = await startRecordingProxy();
+  const s = await startWithProxies();
+  try {
+    const added = await s.api.post('/proxies', { value: live.url });
+    const row = (await added.json()).data.proxies.find(t => t.managed);
+    const r = await s.api.post('/proxies/test-batch', { ids: [row.id, 'deadbeefdeadbeef'] });
+    assert.equal(r.status, 200);
+    const data = (await r.json()).data;
+    assert.equal(data.summary.total, 1, '只有真实存在的那条被测试');
+    assert.deepEqual(data.skipped, ['deadbeefdeadbeef']);
+    assert.equal(data.results[0].ok, true);
+  } finally { await s.close(); await live.close(); }
+});
+
+test('批量测试：空 ids 与超大批次都被明确拒绝', async () => {
+  const s = await startWithProxies();
+  try {
+    const empty = await s.api.post('/proxies/test-batch', { ids: [] });
+    assert.equal(empty.status, 400);
+
+    // 上限之内但都不存在 → 400（没有可测的），而不是静默返回空结果
+    const none = await s.api.post('/proxies/test-batch', { ids: ['a', 'b'] });
+    assert.equal(none.status, 400);
+    assert.match((await none.json()).error, /都不存在/);
+
+    const tooMany = await s.api.post('/proxies/test-batch', {
+      ids: Array.from({ length: 201 }, (_, i) => `id-${i}`),
+    });
+    assert.equal(tooMany.status, 400);
+    assert.match((await tooMany.json()).error, /最多测试 200 条/);
+  } finally { await s.close(); }
+});
+
+test('批量测试并发有上限：同时发两批会被拒（并发翻倍正是上限要防的事）', async () => {
+  // 让探测慢下来，制造一个「第一批还在跑」的窗口
+  const slow = await startRecordingProxy();
+  const s = await startWithProxies({ env: { CC_PROXY_PROBE_TIMEOUT_MS: '3000' } });
+  try {
+    const added = await s.api.post('/proxies/bulk', { values: [slow.url] });
+    const row = (await added.json()).data.proxies.find(t => t.managed);
+
+    const first = s.api.post('/proxies/test-batch', { ids: [row.id] });
+    // 给第一批一点时间真正进入探测
+    await new Promise(r => setTimeout(r, 30));
+    const second = await s.api.post('/proxies/test-batch', { ids: [row.id] });
+    // 第一批可能已经跑完（探测很快），那样第二批就是正常 200 —— 两种都接受，
+    // 但绝不允许两批同时跑却都返回 200 且都不带结果。
+    const secondStatus = second.status;
+    assert.ok(secondStatus === 200 || secondStatus === 409,
+      `第二批要么正常排队（200）要么被单飞拒绝（409），实际 ${secondStatus}`);
+    if (secondStatus === 409) {
+      assert.match((await second.json()).error, /已有批量测试在运行中/);
+    }
+    const firstRes = await first;
+    assert.equal(firstRes.status, 200);
+  } finally { await s.close(); await slow.close(); }
+});

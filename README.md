@@ -391,7 +391,7 @@ Each upstream key can choose which proxy carries it. Three modes, switchable on 
 
 - Every proxy tracks its own health, consecutive failures and cooldown. Only **route-level failures** (connection refused, tunnel timeout, TLS failure) count against a proxy — an upstream 4xx/5xx means the proxy worked and the problem is account- or model-level.
 - When a proxy is unreachable the proxy retries **the same key through another proxy**, not another key: switching keys cannot fix a dead proxy and would wrongly mark good accounts as failed.
-- The admin page can probe any proxy on demand; the test passes on **any HTTP response** (401/403 included).
+- The admin page can probe one proxy, or **select several and probe them in one batch**: the test passes on **any HTTP response** (401/403 included). Batch concurrency is server-side (4 by default, 8 max); one call returns the complete result table in the order you selected, a single failure does not affect the rest, and a batch is capped at 200 entries.
 - A scheduled health check rechecks unhealthy proxies every 15 minutes by default (`CC_PROXY_HEALTH_INTERVAL_MS`), with probe timeouts of `CC_PROXY_HEALTH_TIMEOUT_MS` / `CC_PROXY_PROBE_TIMEOUT_MS` (10 s default).
 
 #### Coverage
@@ -499,7 +499,7 @@ ADMIN_PASSWORD=your-admin-password npm start
 | 🔐 **2API Keys** | Calling credentials issued to **downstream clients**: generate, revoke individually, enable/disable, reveal, per-key request counts. The page opens with a "differences between the two key types" table |
 | 🔑 **Upstream Keys** | Command Code account credentials (`user_`): add/edit/delete, **one-click ⏸ disable / ▶ enable**, 👁 reveal, ⚡ real probe, import from `config`/`env`, rotation strategy |
 | 🧠 Models | **🔄 Sync upstream models**, **multi-select / select-all then batch enable or disable**, single-model test, batch test (limited concurrency, cancellable); only enabled models can be tested |
-| 🌐 **Outbound proxy pool** | Add / bulk-paste / enable / disable / **probe each proxy** / reveal credentials; **key ↔ proxy binding** (auto / bind / rotate), with health, consecutive failures, cooldown and how many keys each proxy carries |
+| 🌐 **Outbound proxy pool** | Add / bulk-paste / enable / disable / **probe one or a selected batch** / reveal credentials; **key ↔ proxy binding** (auto / bind / rotate), with health, consecutive failures, cooldown and how many keys each proxy carries |
 | 📈 Usage | Per-key requests / failures / tokens (today and total): **input split into cache hit / miss, output on its own**, resettable |
 | 📜 Request Log | **SSE live stream** (not polling) with pause, clear and level filter |
 | ⚙️ Settings | Hot-update runtime config (including the **default test model**), change the admin password |
