@@ -109,7 +109,8 @@ export function seedConfig(workdir, overrides = {}) {
 }
 
 /** 在临时 cwd 中启动代理（复刻真实部署：proxy.mjs 与 config.json 同目录）。 */
-export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
+// execArgv 用于预加载 mock（--require）：NODE_OPTIONS 在 Bun 下不生效，命令行参数两边都认。
+export async function startProxy({ upstreamPort, env = {}, cwd, execArgv = [] } = {}) {
   const port = await allocPort();
   const logs = [];
   // 自建的临时工作目录用完必须删；调用方传了 cwd 则由调用方负责。
@@ -127,7 +128,7 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
     // 发请求，模板若带上口令会直接进入严格鉴权模式。
     seedConfig(workdir);
   }
-  const child = spawn(process.execPath, ['proxy.mjs'], {
+  const child = spawn(process.execPath, [...execArgv, 'proxy.mjs'], {
     cwd: workdir,
     env: { ...process.env, PORT: String(port), HOST: '127.0.0.1',
       CC_API_BASE: 'http://127.0.0.1:' + upstreamPort,
