@@ -392,7 +392,7 @@ Each upstream key can choose which proxy carries it. Three modes, switchable on 
 - Every proxy tracks its own health, consecutive failures and cooldown. Only **route-level failures** (connection refused, tunnel timeout, TLS failure) count against a proxy — an upstream 4xx/5xx means the proxy worked and the problem is account- or model-level.
 - When a proxy is unreachable the proxy retries **the same key through another proxy**, not another key: switching keys cannot fix a dead proxy and would wrongly mark good accounts as failed.
 - The admin page can probe one proxy, or **select several and probe them in one batch**: the test passes on **any HTTP response** (401/403 included). Batch concurrency is server-side (4 by default, 8 max); one call returns the complete result table in the order you selected, a single failure does not affect the rest, and a batch is capped at 200 entries.
-- A scheduled health check rechecks unhealthy proxies every 15 minutes by default (`CC_PROXY_HEALTH_INTERVAL_MS`), with probe timeouts of `CC_PROXY_HEALTH_TIMEOUT_MS` / `CC_PROXY_PROBE_TIMEOUT_MS` (10 s default).
+- A scheduled health check rechecks unhealthy proxies every 15 minutes by default (`CC_PROXY_HEALTH_INTERVAL_MS`), with probe timeouts of `CC_PROXY_HEALTH_TIMEOUT_MS` / `CC_PROXY_PROBE_TIMEOUT_MS` (10 s default). It only covers **enabled** entries: a disabled proxy carries no traffic, so probing it would be pure waste, and a rotating pool's egress differs every time anyway.
 
 #### Coverage
 

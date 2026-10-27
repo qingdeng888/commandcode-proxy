@@ -482,6 +482,8 @@ http://user:pass@pool.example.com:8080#pool
   单条失败不影响其余，单次上限 200 条。
 - 定时健康检查默认每 15 分钟复查一次不健康的代理（`CC_PROXY_HEALTH_INTERVAL_MS` 可调），
   探测超时 `CC_PROXY_HEALTH_TIMEOUT_MS` / `CC_PROXY_PROBE_TIMEOUT_MS`（默认 10 秒）。
+  复查只覆盖**启用中且不健康**的条目：已停用的不参与路由，替它打上游纯属浪费；
+  轮换池的出口每次都不同，一次失败说明不了什么。
 
 #### 覆盖范围
 

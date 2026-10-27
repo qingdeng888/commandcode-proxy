@@ -707,3 +707,48 @@ test('批量测试并发有上限：同时发两批会被拒（并发翻倍正�
     assert.equal(firstRes.status, 200);
   } finally { await s.close(); await slow.close(); }
 });
+
+test('定时健康检查跳过已停用的代理（不为不参与路由的条目打上游）', async () => {
+  // 直接在模块层验证：起进程跑 15 分钟的定时器不现实，而这里要断言的正是
+  // 「哪些条目会被 checkHealth 选中」这一条判据本身。
+  const { createProxyPool } = await import('../lib/proxies.mjs');
+  const { CFG } = await import('../lib/config.mjs');
+  const dataDir = mkdtempSync(join(tmpdir(), 'ccp-proxy-health-'));
+  const prevDataDir = process.env.CC_DATA_DIR;
+  process.env.CC_DATA_DIR = dataDir;
+  // createProxyPool 在构造时读 CFG.proxies / CFG.proxyFile：临时改这两项再恢复
+  const prevProxies = CFG.proxies;
+  const prevFile = CFG.proxyFile;
+  const probed = [];
+  CFG.proxies = ['http://127.0.0.1:21101', 'pool+http://127.0.0.1:21102'];
+  CFG.proxyFile = '';
+  let pool;
+  try {
+    pool = createProxyPool({
+      log: () => {},
+      probe: async (t) => { probed.push(t.address); return { reachable: true, status: 200 }; },
+    });
+    const rows = pool.list();
+    const staticRow = rows.find(t => !t.pool);
+    const poolRow = rows.find(t => t.pool);
+
+    // 让两条都进入「不健康」，然后停用静态那条
+    pool.markFailure(staticRow ? pool.transports().find(t => t.id === staticRow.id) : null, new Error('x'));
+    pool.markFailure(pool.transports().find(t => t.id === poolRow.id), new Error('x'));
+    await pool.setEnabled([staticRow.id], false);
+
+    probed.length = 0;
+    await pool.checkHealth();
+
+    assert.ok(!probed.includes(staticRow.address),
+      '已停用的条目不参与路由，定时健康检查不该替它打上游');
+    assert.deepEqual(probed, [], '轮换池条目不记健康状态，同样不该被定时复查');
+  } finally {
+    pool?.stopHealthChecks();
+    CFG.proxies = prevProxies;
+    CFG.proxyFile = prevFile;
+    if (prevDataDir === undefined) delete process.env.CC_DATA_DIR;
+    else process.env.CC_DATA_DIR = prevDataDir;
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});

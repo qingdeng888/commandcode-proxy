@@ -55,6 +55,9 @@ function keyOf(binding) {
 const healthyCount = computed(() => state.list.filter((t) => t.healthy).length)
 const poolCount = computed(() => state.list.filter((t) => t.pool).length)
 const allSelected = computed(() => state.list.length > 0 && selected.value.length === state.list.length)
+// 部分选中：表头复选框画成「不确定」态。没有它，勾了一半时表头看起来是未勾选，
+// 用户会以为自己没选任何东西（参考实现也是这么处理的）。
+const someSelected = computed(() => selected.value.length > 0 && !allSelected.value)
 
 async function load() {
   state.loading = true
@@ -260,6 +263,11 @@ function toggleSelectAll(checked) {
   selected.value = checked ? state.list.map((t) => t.id) : []
 }
 
+/** 表头复选框在「部分选中」时点击应当变成全选，而不是依赖浏览器的默认行为。 */
+function onSelectAllClick(event) {
+  toggleSelectAll(event.target.checked)
+}
+
 /** 绑定改动：mode 变化后立即重读，因为 auto 的实际落点是服务端算的。 */
 async function setBinding(keyId, mode, proxyId) {
   busy.rowId = keyId
@@ -393,7 +401,12 @@ onMounted(async () => {
           <thead>
             <tr>
               <th style="width: 34px">
-                <input type="checkbox" :checked="allSelected" @change="toggleSelectAll($event.target.checked)" />
+                <input
+                  type="checkbox"
+                  :checked="allSelected"
+                  :indeterminate.prop="someSelected"
+                  @change="onSelectAllClick"
+                />
               </th>
               <th>地址</th>
               <th>来源</th>
@@ -456,14 +469,20 @@ onMounted(async () => {
               </td>
               <td>
                 <div class="flex" style="gap: 6px; flex-wrap: wrap">
-                  <button class="btn btn-sm" type="button" :disabled="busy.testingId === t.id" @click="test(t)">
+                  <button
+                    class="btn btn-sm"
+                    type="button"
+                    :disabled="busy.testingId === t.id || busy.batch || !t.enabled"
+                    :title="!t.enabled ? '已停用的代理不参与路由，无需测试' : ''"
+                    @click="test(t)"
+                  >
                     <span v-if="busy.testingId === t.id" class="loading"></span>
                     {{ busy.testingId === t.id ? '检测中…' : '🔍 测试' }}
                   </button>
                   <button
                     class="btn btn-sm"
                     type="button"
-                    :disabled="busy.rowId === t.id || !t.enabled"
+                    :disabled="busy.rowId === t.id || busy.batch || !t.enabled"
                     @click="toggleEnabled(t, false)"
                   >⏸ 停用</button>
                   <button
